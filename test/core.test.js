@@ -500,19 +500,22 @@ test("the guard line: the same for every command, immune to the user's shell, an
   // Inside: the claim from the environment, taken out of it at once; the guard's own group checked;
   // one claim; tools found past functions and the user's PATH; every wait checked.
   const steps = script.split("; ");
-  assert.deepEqual(steps.slice(0, 8), [
+  assert.deepEqual(steps.slice(0, 10), [
     "d=$SHELL_WATCHDOG_CLAIM",
     'command test -n "$d" || exit 0',
     "unset SHELL_WATCHDOG_CLAIM",
     'trap "" TERM',
     'g=$(command -p ps -o pgid= -p "$$" | command -p tr -d "[:space:]")',
     'command test "$g" = "$1" || exit 0',
-    'command -p mkdir "$d" 2>/dev/null || exit 0',
-    'command echo "$1" > "$d/pid" || exit 0',
+    "set -C",
+    '{ command echo "$1" > "$d.pid"',
+    "} 2>/dev/null || exit 0",
+    "set +C",
   ]);
-  assert.ok(script.endsWith('while command kill -0 "$1" 2>/dev/null && command test -d "$d"; do if command test -e "$d/stop"; then command kill -TERM "-$1"; command -p sleep 5 || exit 0; command kill -KILL "-$1"; exit 0; fi; command -p sleep 3 || exit 0; done'));
+  assert.doesNotMatch(script, /mkdir/, "the claim is made by the shell itself, not by a tool that may not be atomic");
+  assert.ok(script.endsWith('while command kill -0 "$1" 2>/dev/null && command test -e "$d.pid"; do if command test -e "$d.stop"; then command kill -TERM "-$1"; command -p sleep 5 || exit 0; command kill -KILL "-$1"; exit 0; fi; command -p sleep 3 || exit 0; done'));
   assert.doesNotMatch(script, /kill -[A-Z0-9]+ "?-?0"?(;| )/, "never the group the guard merely happens to be in");
-  assert.doesNotMatch(script.replace(/command -p (ps|tr|mkdir|sleep)|command (test|echo|kill)/g, ""), /\b(ps|tr|mkdir|sleep|test|echo|kill)\b/, "no tool is called by its bare name");
+  assert.doesNotMatch(script.replace(/command -p (ps|tr|sleep)|command (test|echo|kill)/g, ""), /\b(ps|tr|mkdir|sleep|test|echo|kill)\b/, "no tool is called by its bare name");
   assert.match(guardScript({ poll: 1, grace: 2 }), /command -p sleep 2 \|\| exit 0; command kill -KILL "-\$1"; exit 0; fi; command -p sleep 1 \|\| exit 0; done$/);
 });
 

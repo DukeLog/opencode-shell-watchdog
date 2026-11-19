@@ -64,10 +64,13 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
       }
     },
 
+    // A claim is two files next to each other: <claim>.pid, made by the guard, and <claim>.stop,
+    // made here to tell that guard to stop its command.
+
     /** The pid a guard wrote when it made the claim, as text; null when nobody has made it (yet). */
     async readClaim(claim) {
       try {
-        return (await readFile(join(claim, "pid"), "utf8")).trim();
+        return (await readFile(`${claim}.pid`, "utf8")).trim();
       } catch (error) {
         if (error?.code === "ENOENT") return null;
         throw error;
@@ -76,17 +79,19 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
 
     /** Tells the guard that made the claim to stop its command. Fails when the claim does not exist. */
     async requestStop(claim) {
-      await writeFile(join(claim, "stop"), "");
+      await stat(`${claim}.pid`);
+      await writeFile(`${claim}.stop`, "");
     },
 
     /** Takes a stop back, in case the guard has not seen it yet. */
     async cancelStop(claim) {
-      await rm(join(claim, "stop"), { force: true });
+      await rm(`${claim}.stop`, { force: true });
     },
 
     /** Removes a claim that is not needed any more; its guard, if still there, leaves. */
     async dropClaim(claim) {
-      await rm(claim, { recursive: true, force: true });
+      await rm(`${claim}.pid`, { force: true });
+      await rm(`${claim}.stop`, { force: true });
     },
 
     log(entry) {

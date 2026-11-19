@@ -130,7 +130,7 @@ test("a command with a live guard behaves like the same command without one", { 
         const [plain, tagged] = await Promise.all([run(shell, script), run(shell, job.command, job.env)]);
         assert.deepEqual(tagged, plain, script);
         assert.ok(Date.now() - started < 4000, `the guard does not hold the command up: ${script}`);
-        assert.ok(await until(() => existsSync(join(job.claim, "pid")), 3000), `a guard was really running beside: ${script}`);
+        assert.ok(await until(() => existsSync(`${job.claim}.pid`), 3000), `a guard was really running beside: ${script}`);
       }
     });
   }
@@ -186,6 +186,28 @@ test("the text of a command can be copied anywhere: without the launch's environ
         killGroups(first.pid, copy.pid, nested.pid, replay.pid);
       }
     });
+  }
+});
+
+test("two launches with one claim, started at the same moment, many times: one guard, never two", { skip: !posix }, async () => {
+  // What a claim made with `mkdir` got wrong where mkdir is not atomic (uutils): both got in.
+  const shell = "/bin/sh";
+  const rounds = Array.from({ length: 24 }, () => guarded("sleep 20"));
+  const pairs = rounds.map((job) => [start(shell, job.command, job.env), start(shell, job.command, job.env)]);
+  try {
+    for (const job of rounds) assert.ok(await until(async () => (await io.readClaim(job.claim)) !== null), "somebody made the claim");
+    await pause(1200);
+    await Promise.all(rounds.map((job) => io.requestStop(job.claim)));
+    await pause(3500);
+    const alive = pairs.map((pair) => pair.filter((job) => io.alive(job.pid)).length);
+    assert.deepEqual(alive, pairs.map(() => 1), "of every pair exactly one is stopped");
+    for (const [index, job] of rounds.entries()) {
+      const owner = Number(await io.readClaim(job.claim));
+      const stopped = pairs[index].find((launch) => !io.alive(launch.pid));
+      assert.equal(owner, stopped.pid, "and it is the one whose pid is in the claim");
+    }
+  } finally {
+    killGroups(...pairs.flat().map((job) => job.pid));
   }
 });
 
@@ -297,15 +319,14 @@ test("claims: a part of the directory for every server; read, stop, take back, d
   const claim = join(space, randomUUID());
   assert.equal(await io.readClaim(claim), null, "nobody has made it");
   await assert.rejects(io.requestStop(claim), { code: "ENOENT" });
-  await mkdir(claim);
-  await writeFile(join(claim, "pid"), "4242\n");
+  await writeFile(`${claim}.pid`, "4242\n");
   assert.equal(await io.readClaim(claim), "4242");
   await io.requestStop(claim);
   await io.requestStop(claim); // asking twice is asking once
-  assert.equal(existsSync(join(claim, "stop")), true);
+  assert.equal(existsSync(`${claim}.stop`), true);
   await io.cancelStop(claim);
   await io.cancelStop(claim);
-  assert.equal(existsSync(join(claim, "stop")), false);
+  assert.equal(existsSync(`${claim}.stop`), false);
   await io.dropClaim(claim);
   await io.dropClaim(claim);
   assert.equal(await io.readClaim(claim), null);
@@ -314,8 +335,8 @@ test("claims: a part of the directory for every server; read, stop, take back, d
   // a guard of a long-running command may be at work in it.
   const base = join(space, "..");
   const other = await io.prepareClaims("server-2");
-  const theirs = join(other, randomUUID());
-  await mkdir(theirs);
+  const theirs = `${join(other, randomUUID())}.pid`;
+  await writeFile(theirs, "1\n");
   const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60_000);
   await utimes(other, longAgo, longAgo);
   assert.equal(await io.prepareClaims("server-1"), space, "making the own part again changes nothing");

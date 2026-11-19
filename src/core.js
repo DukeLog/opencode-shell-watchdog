@@ -561,9 +561,11 @@ export function killReason(rec) {
 //     variable from the command's shell at once, so that not even the command's own children
 //     inherit it;
 //   - goes on only if it is a member of the process group led by the command's shell;
-//   - claims the id by creating the directory (only the first to try can) and writes the pid of the
-//     command's shell there;
-//   - waits for the file <claim>/stop. When the watchdog creates it, the guard sends SIGTERM and, a
+//   - makes its claim by creating the file <claim>.pid with the pid of the command's shell in it.
+//     Only the first to try can: the file is created by the shell itself with no-clobber on, which
+//     is one exclusive open. (Not by `mkdir`: the one of uutils, on newer Ubuntu, lets two callers
+//     both succeed.)
+//   - waits for the file <claim>.stop. When the watchdog creates it, the guard sends SIGTERM and, a
 //     few seconds later, SIGKILL to the process group it is in.
 // As long as the guard lives, that group exists and its id cannot be given to anything else. So a
 // guard can only ever stop the group it was started in, whatever happens to pids, clocks or events.
@@ -571,8 +573,8 @@ export function killReason(rec) {
 // the environment of one launch to another process on purpose; that person can stop the command anyway.
 //
 // Nothing in the line depends on the user's shell setup: every word is quoted (no alias applies),
-// /bin/sh is called by its path, and inside it the tools are found on the system's default path,
-// past any function of the same name.
+// /bin/sh is called by its path, and inside it the tools (ps, tr, sleep) are found on the system's
+// default path, past any function of the same name.
 //
 // The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
 // `jobs` and `$!` do not see it. It leaves when the command's shell is gone or its claim is removed.
@@ -600,9 +602,11 @@ export function guardScript({ poll = GUARD_POLL, grace = GUARD_GRACE } = {}) {
     // Own process group, as ps knows it: it has to be the one led by the command's shell.
     `g=$(command -p ps -o pgid= -p "$$" | command -p tr -d "[:space:]")`,
     `command test "$g" = "$1" || exit 0`,
-    `command -p mkdir "$d" 2>/dev/null || exit 0`,
-    `command echo "$1" > "$d/pid" || exit 0`,
-    `while command kill -0 "$1" 2>/dev/null && command test -d "$d"; do if command test -e "$d/stop"; then ${stop}; fi; command -p sleep ${poll} || exit 0; done`,
+    // The claim: created only if it is not there yet, by the shell's own exclusive open.
+    `set -C`,
+    `{ command echo "$1" > "$d.pid"; } 2>/dev/null || exit 0`,
+    `set +C`,
+    `while command kill -0 "$1" 2>/dev/null && command test -e "$d.pid"; do if command test -e "$d.stop"; then ${stop}; fi; command -p sleep ${poll} || exit 0; done`,
   ].join("; ");
 }
 
