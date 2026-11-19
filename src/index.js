@@ -9,9 +9,10 @@ import { randomUUID } from "node:crypto";
 import { parseOptions } from "./core.js";
 import { createIO } from "./io.js";
 import { follow } from "./stream.js";
-import { addInstance, beforeCreate, handleEvent, removeInstance, sharedState, tick, toolCall } from "./watchdog.js";
+import { addInstance, beforeCreate, handleEvent, liveTags, removeInstance, sharedState, tick, toolCall } from "./watchdog.js";
 
 const EVENTS = ["shell.created", "shell.exited", "shell.deleted", "session.deleted"];
+const CLAIM_MAX_AGE = 24 * 60 * 60_000;
 
 // Code Mode shows only the first paragraph of a description, cut at about 500 characters. Everything
 // the model has to know before it launches a command is therefore said there, and briefly.
@@ -59,6 +60,7 @@ export default {
       settings,
       dir: ctx.location?.directory,
       workspace: ctx.location?.workspaceID ?? null,
+      claims: null,
       disposed: false,
     };
     const controller = new AbortController();
@@ -78,9 +80,12 @@ export default {
     };
 
     try {
-      // A command launched with a kill limit gets a unique first line. It ends up in the argv of
-      // exactly that process, which later proves that a pid still is the command and not a reused
-      // number.
+      // Where the guards of kill-limited commands claim their ids. Without it nothing gets a limit.
+      inst.claims = await io.prepareClaims();
+      // Claims left behind by commands nobody watches any more (a restart loses the list of them).
+      void io.sweepClaims(liveTags(state), CLAIM_MAX_AGE);
+
+      // A command launched with a kill limit gets a guard with an id of its own in front of it.
       registrations.push(await ctx.shell.hook("create.before", (event) => beforeCreate(state, io, inst, event, randomUUID)));
 
       registrations.push(

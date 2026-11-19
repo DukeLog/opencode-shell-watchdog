@@ -2,9 +2,18 @@
 
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import { test } from "node:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
 import plugin from "../src/index.js";
-import { splitTag } from "../src/core.js";
+import { guardLine, splitTag } from "../src/core.js";
+
+// The plugin keeps the claims of guards under the state directory: give it one of its own here.
+const STATE = mkdtempSync(join(tmpdir(), "watchdog-state-"));
+process.env.XDG_STATE_HOME = STATE;
+const CLAIMS = join(STATE, "opencode-shell-watchdog", "claims");
+after(() => rmSync(STATE, { recursive: true, force: true }));
 import { follow, sleep } from "../src/stream.js";
 import { sharedState } from "../src/watchdog.js";
 
@@ -62,6 +71,8 @@ test("setup registers the hook, the tool and one instance; cleanup takes all of 
   assert.equal(plugin.id, "shell-watchdog");
   assert.deepEqual(ctx.hooks.map((hook) => hook.name), ["create.before"]);
   assert.equal(instancesAt("/index-1").length, 1);
+  assert.equal(instancesAt("/index-1")[0].claims, CLAIMS);
+  assert.ok(existsSync(CLAIMS), "the claims directory is made at setup");
   assert.equal(ctx.streams.length, 1);
   assert.deepEqual(ctx.streams[0].types, ["shell.created", "shell.exited", "shell.deleted", "session.deleted"]);
 
@@ -108,7 +119,7 @@ test("the hook gives every launch of a kill-limited command a tag of its own", a
     assert.match(tags[0].tag, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.notEqual(tags[0].tag, tags[1].tag);
     assert.deepEqual(tags.map((split) => split.command), [text, text]);
-    assert.deepEqual(first.command.split("\n").slice(1), ["trap : EXIT", ...text.split("\n")]);
+    assert.deepEqual(first.command.split("\n").slice(1), [guardLine(tags[0].tag, CLAIMS), ...text.split("\n")]);
 
     // The already tagged text launched once more: the old tag is not taken over.
     const again = { command: first.command, shell: "/bin/zsh" };

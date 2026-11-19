@@ -7,8 +7,6 @@ import {
   addTag,
   applySettings,
   assess,
-  birthTime,
-  captureBirth,
   commit,
   composeMessage,
   createMemory,
@@ -18,14 +16,12 @@ import {
   feed,
   formatDuration,
   killReason,
+  guardLine,
   learnedOf,
-  membersOf,
   MESSAGE_CAP,
   parseDirective,
   parseDuration,
   parseOptions,
-  parseInspect,
-  parseProcesses,
   reportBlock,
   resolveSettings,
   setObserve,
@@ -39,22 +35,19 @@ import {
   tailLines,
   taint,
   thresholdOf,
-  verifyLeader,
-  verifySurvivors,
   wantsTag,
 } from "../src/core.js";
 
 const MIN = 60_000;
 const TAG = "0a1b2c3d-1111-2222-3333-444455556666";
-const BIRTH = "Thu Nov 19 14:34:54 2026";
 
-/** A watched command; with a tag it also has its process, as after the first pass. */
+/** A watched command; with a tag it also has its guard, as after the first pass. */
 function record(settings = {}, extra = {}) {
   const rec = createRecord(
     { id: "sh_1", sessionID: "ses_1", pid: 4242, file: "/out", command: "./job.sh", dir: "/p", workspace: null, startedWall: 1_000_000, ...extra },
     { ...SETTING_DEFAULTS, ...settings },
   );
-  if (rec.tag) rec.birth = BIRTH;
+  if (rec.tag) rec.bound = true;
   return rec;
 }
 
@@ -419,14 +412,14 @@ test("nothing is concluded about silence from a pass that did not take in the ou
   assert.equal(decide(runtime).periodic, true, "nor does a periodic report");
 });
 
-test("kill limits need a tag and the process it was found on", () => {
+test("kill limits need a tag and the guard that claimed it", () => {
   const untagged = record({ killRuntime: MIN });
   pass(untagged, 10 * MIN);
   assert.equal(killReason(untagged), null);
   const unbound = record({ killRuntime: MIN }, { tag: TAG });
-  unbound.birth = null;
+  unbound.bound = false;
   pass(unbound, 10 * MIN);
-  assert.equal(killReason(unbound), null, "tagged, but its process has not been seen yet");
+  assert.equal(killReason(unbound), null, "tagged, but its guard has not been seen yet");
 
   const rec = record({ killRuntime: 10 * MIN, killSilence: 0 }, { tag: TAG });
   pass(rec, 9 * MIN, ["x"]);
@@ -455,11 +448,11 @@ test("tag: wanted only when a kill limit is armed and the shell can carry it", (
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "darwin"), true);
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "win32"), false);
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "cmd.exe", defaults, "linux"), false);
-  assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.ps1", "/usr/bin/pwsh", defaults, "linux"), false, "no trap line there");
-  for (const shell of ["/bin/sh", "/bin/bash", "/usr/bin/zsh", "/bin/dash", "/bin/ash", "/usr/bin/fish"]) {
+  assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.ps1", "/usr/bin/pwsh", defaults, "linux"), false, "cannot run the guard line");
+  for (const shell of ["/bin/sh", "/bin/bash", "/usr/bin/zsh", "/bin/dash", "/bin/ash"]) {
     assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", shell, defaults, "linux"), true, shell);
   }
-  for (const shell of ["/bin/ksh", "/bin/mksh", "/usr/bin/tcsh", "/usr/bin/python3", ""]) {
+  for (const shell of ["/usr/bin/fish", "/bin/ksh", "/bin/mksh", "/usr/bin/tcsh", "/usr/bin/python3", ""]) {
     assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", shell, defaults, "linux"), false, shell);
   }
   assert.equal(wantsTag("# watchdog: off kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "linux"), false);
@@ -470,127 +463,33 @@ test("tag: wanted only when a kill limit is armed and the shell can carry it", (
 
 test("tag: two lines in front of the command, both removed again", () => {
   const command = "# watchdog: kill-runtime=2h\n./job.sh";
-  const tagged = addTag(command, TAG);
-  assert.equal(tagged, `# shell-watchdog:${TAG}\ntrap : EXIT\n# watchdog: kill-runtime=2h\n./job.sh`);
+  const tagged = addTag(command, TAG, "/state/claims");
+  const lines = tagged.split("\n");
+  assert.equal(lines.length, 4);
+  assert.equal(lines[0], `# shell-watchdog:${TAG}`);
+  assert.equal(lines[1], guardLine(TAG, "/state/claims"));
+  assert.ok(lines[1].endsWith(" # shell-watchdog guard"));
   assert.deepEqual(splitTag(tagged), { tag: TAG, command });
   assert.deepEqual(parseDirective(splitTag(tagged).command, "/bin/zsh").pairs, [["kill-runtime", "2h"]], "the directive is the first line again");
-  assert.deepEqual(splitTag(addTag("trap : EXIT\n./job.sh", TAG)), { tag: TAG, command: "trap : EXIT\n./job.sh" }, "a trap line of the command itself stays");
-  assert.deepEqual(splitTag(`# shell-watchdog:${TAG.toUpperCase()}\n./job.sh`), { tag: TAG, command: "./job.sh" });
+  assert.deepEqual(splitTag(`# shell-watchdog:${TAG.toUpperCase()}\n./job.sh`), { tag: TAG, command: "./job.sh" }, "a tag line without its guard line");
 
   assert.deepEqual(splitTag("./job.sh"), { tag: null, command: "./job.sh" });
   assert.equal(splitTag("echo hi\n# shell-watchdog:" + TAG + "\n").tag, null, "only as the first line");
   assert.equal(splitTag(`# shell-watchdog:${TAG}`).tag, null, "only as a whole line");
-  assert.equal(stripTags(addTag(addTag(command, TAG), TAG.replace("0a", "0b"))), command, "every tag layer is removed");
+  assert.equal(stripTags(addTag(addTag(command, TAG, "/a"), TAG.replace("0a", "0b"), "/b")), command, "every tag layer is removed");
   assert.equal(stripTags(command), command);
 });
 
-test("the tag counts only as the first line of the script the shell was started with", () => {
-  const rec = { pid: 4242, tag: TAG, startedWall: birthTime(BIRTH) + 300 };
-  const seen = (argv) => ({ pgid: 4242, birth: BIRTH, argv });
-  const bound = (argv) => captureBirth(seen(argv), rec);
-  assert.deepEqual(bound(`/bin/zsh +o nomatch -c # shell-watchdog:${TAG}\\012./job.sh`), { birth: BIRTH }, "macOS ps: the line break is shown as \\012");
-  assert.deepEqual(bound(`/bin/zsh -c # shell-watchdog:${TAG}\n./job.sh`), { birth: BIRTH }, "a real line break");
-  assert.deepEqual(bound(`sh -c # shell-watchdog:${TAG} trap : EXIT ./job.sh`), { birth: BIRTH }, "procps: the line break is shown as a space");
-  assert.deepEqual(bound(`sh -c # shell-watchdog:${TAG}`), { birth: BIRTH }, "end of the command line");
-  assert.deepEqual(bound(`/bin/bash -lc # shell-watchdog:${TAG}\\012x`), { birth: BIRTH }, "any option group that ends in c");
-
-  for (const [argv, why] of [
-    ["/usr/bin/some-daemon --serve", "another program"],
-    ["", "an empty command line"],
-    [`/bin/zsh -c # shell-watchdog:${TAG}ff\\012x`, "a longer id"],
-    [`/bin/zsh -c # shell-watchdog:${TAG}XYZ\\012x`, "something glued to the id"],
-    [`/bin/zsh -c # shell-watchdog:${TAG}-x`, "something glued to the id"],
-    [`/bin/zsh -c # shell-watchdog:${TAG.replace("0a", "0b")}\\012x`, "another id"],
-    [`/bin/zsh -c echo hi\\012# shell-watchdog:${TAG}\\012x`, "further down in the script"],
-    [`/bin/zsh -c foo -c # shell-watchdog:${TAG}\\012x`, "after a -c of the command itself"],
-    [`/bin/zsh -c echo '# shell-watchdog:${TAG}'`, "inside quotes"],
-    [`# shell-watchdog:${TAG}\\012x`, "not a shell started with -c"],
-    [`/usr/bin/tail -f # shell-watchdog:${TAG}`, "an argument of something else"],
-  ]) {
-    assert.match(bound(argv).error, /is not the command that was launched/, why);
-  }
-});
-
-test("a kill limit is bound to the process that was started for the command, and to no other", () => {
-  const argv = `/bin/zsh +o nomatch -c # shell-watchdog:${TAG}\\012trap : EXIT\\012./job.sh`;
-  const born = birthTime(BIRTH);
-  const rec = (late) => ({ pid: 4242, tag: TAG, startedWall: born + late });
-  const seen = { pgid: 4242, birth: BIRTH, argv };
-
-  // The command's start time is taken at the spawn, ps cuts the start of the process to the second.
-  assert.deepEqual(captureBirth(seen, rec(0)), { birth: BIRTH });
-  assert.deepEqual(captureBirth(seen, rec(999)), { birth: BIRTH });
-  assert.deepEqual(captureBirth(seen, rec(2000)), { birth: BIRTH });
-  assert.deepEqual(captureBirth(seen, rec(-1000)), { birth: BIRTH });
-  assert.match(captureBirth(seen, rec(2001)).error, /did not start when the command was started/);
-  assert.match(captureBirth(seen, rec(-1001)).error, /did not start when the command was started/);
-  assert.match(captureBirth(seen, rec(-60_000)).error, /did not start when the command was started/, "a later process with the same text");
-  assert.match(captureBirth(seen, rec(Number.NaN)).error, /did not start when/);
-  assert.match(captureBirth({ ...seen, birth: "some day" }, rec(0)).error, /did not start when/, "a start time that cannot be read");
-  assert.match(captureBirth(null, rec(0)).error, /was not found/);
-  assert.match(captureBirth({ ...seen, pgid: 7 }, rec(0)).error, /does not lead its own process group/);
-
-  // Later, before a signal: the same process, still carrying the tag, still leading its group.
-  const target = { pid: 4242, tag: TAG, birth: BIRTH };
-  assert.equal(verifyLeader(seen, target), null);
-  assert.match(verifyLeader({ ...seen, birth: "Thu Nov 19 14:34:55 2026" }, target), /pid 4242 now belongs to another process/, "same text, one second younger");
-  assert.match(verifyLeader({ ...seen, argv: "./server" }, target), /is not the command that was launched/);
-  assert.match(verifyLeader({ ...seen, pgid: 7 }, target), /does not lead its own process group/);
-  assert.match(verifyLeader(null, target), /was not found/);
-  assert.match(verifyLeader(undefined, target), /could not be read/);
-  assert.match(verifyLeader(seen, { pid: 4242, tag: TAG, birth: null }), /no kill limit bound to its process/);
-  assert.match(verifyLeader(seen, { pid: 4242, tag: null, birth: BIRTH }), /no kill limit bound to its process/);
-});
-
-test("SIGKILL only for processes that were in the group when the SIGTERM went out", () => {
-  const argv = `/bin/zsh -c # shell-watchdog:${TAG}\\012./job.sh`;
-  const leader = { pid: 4242, pgid: 4242, birth: BIRTH };
-  const child = { pid: 5000, pgid: 4242, birth: "Thu Nov 19 14:35:10 2026" };
-  const entry = { pid: 4242, tag: TAG, birth: BIRTH, members: membersOf([leader, child, { pid: 9, pgid: 9, birth: BIRTH }], 4242) };
-  assert.deepEqual(entry.members, [{ pid: 4242, birth: BIRTH }, { pid: 5000, birth: "Thu Nov 19 14:35:10 2026" }]);
-  const same = { pgid: 4242, birth: BIRTH, argv };
-
-  assert.equal(verifySurvivors([child], null, entry), null, "the leader is gone, a child of that time is left");
-  assert.equal(verifySurvivors([child], undefined, entry), null, "the leader is not in the table: nothing to check about it");
-  assert.equal(verifySurvivors([leader, child], same, entry), null, "the leader is still the same process");
-  assert.equal(verifySurvivors([leader], same, entry), null, "and may be the only one left");
-  assert.equal(verifySurvivors([leader, child], null, entry), null, "the leader exited between the two readings");
-  assert.match(verifySurvivors([leader, child], undefined, entry), /process 4242 could not be checked/);
-  assert.match(verifySurvivors([leader, child], { ...same, birth: "Thu Nov 19 15:00:00 2026" }, entry), /now belongs to another process/);
-  assert.match(verifySurvivors([leader, child], { ...same, argv: "/usr/bin/other" }, entry), /now belongs to another process/);
-
-  // The group id is in use again: nobody in it was there at the time.
-  assert.match(verifySurvivors([{ pid: 6000, pgid: 4242, birth: BIRTH }], null, entry), /is left from before the SIGTERM/, "another pid");
-  assert.match(verifySurvivors([{ ...child, birth: "Thu Nov 19 16:00:00 2026" }], null, entry), /is left from before/, "a known pid, born again");
-  assert.match(verifySurvivors([{ ...child, pgid: 77 }], null, entry), /is left from before/, "a known process, in another group now");
-  assert.match(verifySurvivors([], null, entry), /is left from before/);
-  assert.match(verifySurvivors(null, same, entry), /could not be read/);
-});
-
-test("ps output", () => {
-  const table = "    1     1 Sat Nov 14 16:30:53 2026    \n  187 51618 Thu Nov  5 04:34:04 2026\n 7032  7032 Thu Nov 19 14:34:54 2026\nnoise\n 12 12 yesterday\n";
-  assert.deepEqual(parseProcesses(table), [
-    { pid: 1, pgid: 1, birth: "Sat Nov 14 16:30:53 2026" },
-    { pid: 187, pgid: 51618, birth: "Thu Nov 5 04:34:04 2026" },
-    { pid: 7032, pgid: 7032, birth: "Thu Nov 19 14:34:54 2026" },
-  ]);
-
-  assert.deepEqual(parseInspect(` 1428 Thu Nov 19 14:34:54 2026     /bin/zsh +o nomatch -c # shell-watchdog:${TAG}\\012./job.sh\n`), {
-    pgid: 1428,
-    birth: "Thu Nov 19 14:34:54 2026",
-    argv: `/bin/zsh +o nomatch -c # shell-watchdog:${TAG}\\012./job.sh`,
-  });
-  assert.deepEqual(parseInspect("      1 Thu Nov  5 17:34:53 2026 sleep 30\n"), { pgid: 1, birth: "Thu Nov 5 17:34:53 2026", argv: "sleep 30" });
-  assert.equal(parseInspect("7 Thu Nov 19 14:34:54 2026 sh -c a\nb\n").argv, "sh -c a\nb", "a command line with a real line break");
-  assert.equal(parseInspect(""), null);
-  assert.equal(parseInspect("ps: something went wrong"), null);
-  assert.equal(parseInspect("12 sleep 30"), null);
-
-  assert.equal(birthTime("Thu Nov 19 14:34:54 2026"), new Date(2026, 10, 19, 14, 34, 54).getTime());
-  assert.equal(birthTime("Thu Nov 5 04:34:04 2026"), new Date(2026, 10, 5, 4, 34, 4).getTime());
-  for (const bad of ["", "yesterday", "Thu Foo 19 14:34:54 2026", "2026-11-19 14:34:54", undefined, null]) {
-    assert.ok(Number.isNaN(birthTime(bad)), String(bad));
-  }
+test("the guard line: one line of plain sh, with the claim path safely quoted", () => {
+  const line = guardLine(TAG, "/home/it's me/state dir/claims");
+  assert.doesNotMatch(line, /\n/);
+  assert.ok(line.includes(`d='/home/it'\\''s me/state dir/claims/${TAG}';`), line);
+  // The id can be claimed once, by a shell that leads its own group; the group it stops is that one.
+  assert.match(line, /kill -0 "-\$\$" 2>\/dev\/null && mkdir "\$d" 2>\/dev\/null && echo "\$\$" > "\$d\/pid" \|\| exit 0;/);
+  assert.match(line, /while kill -0 "\$\$" 2>\/dev\/null && \[ -d "\$d" \]; do if \[ -e "\$d\/stop" \]; then kill -TERM "-\$\$"; sleep 5; kill -KILL "-\$\$"; exit 0; fi; sleep 3; done/);
+  assert.doesNotMatch(line, /kill -[A-Z]+ 0\b/, "never the group the guard merely happens to be in");
+  assert.match(line, /^\( \( trap '' TERM; .* \) <\/dev\/null >\/dev\/null 2>&1 & \) # shell-watchdog guard$/);
+  assert.match(guardLine(TAG, "/c", { poll: 1, grace: 2 }), /sleep 2; kill -KILL "-\$\$"; exit 0; fi; sleep 1; done/);
 });
 
 const size = (text) => Buffer.byteLength(text, "utf8");
@@ -608,8 +507,8 @@ test("texts are cut by bytes, never inside a character", () => {
 });
 
 test("report text is bounded", () => {
-  assert.equal(shortCommand(addTag("# watchdog: report=5m\n./a.sh\n./b.sh", TAG)), "./a.sh … (+1 more lines)");
-  assert.equal(shortCommand(addTag("./job.sh", TAG)), "./job.sh", "neither of the two tag lines is shown");
+  assert.equal(shortCommand(addTag("# watchdog: report=5m\n./a.sh\n./b.sh", TAG, "/claims")), "./a.sh … (+1 more lines)");
+  assert.equal(shortCommand(addTag("./job.sh", TAG, "/claims")), "./job.sh", "neither of the two tag lines is shown");
   assert.ok(size(shortCommand("x".repeat(5000))) <= 200);
   assert.ok(size(shortCommand(`${"я".repeat(5000)}\nmore`)) <= 200);
   assert.equal(shortCommand(""), "(empty command)");

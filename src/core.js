@@ -168,9 +168,8 @@ export function resolveSettings(defaults, directive) {
 const DIRECTIVE = /^\s*#+\s*watchdog\s*:\s*(.*)$/i;
 // Shells where a first line starting with "#" is a comment.
 const DIRECTIVE_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish", "pwsh", "powershell"]);
-// Shells whose commands can carry a kill tag (see addTag). Not ksh and mksh: with an EXIT trap set
-// they turn a death by signal into an ordinary exit code, mksh even into 0.
-const TAG_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "fish"]);
+// Shells that can run the guard line of a kill limit (see addTag): the ones it was tested in.
+const TAG_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash"]);
 
 export function shellName(shell) {
   return String(shell ?? "").split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
@@ -391,12 +390,12 @@ export function createRecord(raw, settings, notes = []) {
     lastReport: 0,
     checkAt: 0,
 
-    // Automatic kill needs both: tag, the unique id written into the command at launch, and birth,
-    // the start time of the process found carrying that tag (see captureBirth). killed is set once
-    // SIGTERM went out.
+    // Automatic kill. tag: the id of the guard that was started with the command (null: no kill
+    // limit possible). bound: the guard was seen to have claimed that id for this very shell.
+    // killed: set once the guard was told to stop the command.
     tag: raw.tag ?? null,
-    birth: null,
-    identityTries: 0,
+    bound: false,
+    claimTries: 0,
     killed: null,
   };
 }
@@ -531,7 +530,7 @@ export const killArmed = (settings) => settings.killSilence > 0 || settings.kill
 
 /** Why the command must be killed now, or null. Silence needs the output as this pass saw it. */
 export function killReason(rec) {
-  if (rec.killed || !rec.tag || !rec.birth) return null;
+  if (rec.killed || !rec.tag || !rec.bound) return null;
   const { killRuntime, killSilence } = rec.settings;
   if (killRuntime > 0 && rec.clock >= killRuntime) {
     return { setting: "killRuntime", text: `ran for ${formatDuration(rec.clock)}, limit kill-runtime=${formatSetting(killRuntime)}` };
@@ -543,21 +542,51 @@ export function killReason(rec) {
   return null;
 }
 
-// Identity of a command that may be killed: a unique comment line written into the command when it is
-// launched. It ends up in the argv of exactly that process, so a reused pid can never pass for it.
+// How a command is killed.
 //
-// A shell replaces itself with the last command of its script, and the tag would leave the argv with
-// it. No shell does that while an EXIT trap is set, so a tagged command gets one as its second line.
-// It runs before anything of the command, does nothing, leaves the exit status alone, and the command
-// is free to set a trap of its own.
+// The watchdog never sends a signal. Telling which process a pid belongs to cannot be done safely from
+// outside: pids are given out again, and what `ps` says is already old when it is read. Instead, a
+// command that is launched with a kill limit gets two lines in front of it:
+//
+//     # shell-watchdog:<id>          a random id, new for every launch
+//     ( ( … ) & ) # shell-watchdog guard
+//
+// The second line starts a guard: a small loop in the command's own process group. It claims the id
+// by creating the directory <claims>/<id> (only the first to try can), writes the pid of its shell
+// there, and then waits for the file <claims>/<id>/stop. When the watchdog creates that file, the
+// guard sends SIGTERM and, a few seconds later, SIGKILL to the process group led by its shell, which
+// is the group it lives in itself. Whatever happens to pids meanwhile, a guard can only ever stop the
+// group it was started in, and that group cannot be given to anybody else while the guard is in it.
+// A shell that does not lead a group of its own gets no guard at all: the line gives up at once.
+//
+// The guard is not a child of the command's shell (it is started from a subshell that exits at
+// once), so `wait`, `jobs` and `$!` of the command do not see it. It leaves when the shell is gone or
+// its claim is removed.
 const TAG_PREFIX = "# shell-watchdog:";
 const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/i;
-const GUARD_LINE = "trap : EXIT\n";
+const GUARD_MARK = " # shell-watchdog guard";
+const GUARD_LINE = /^[^\n]* # shell-watchdog guard\r?\n/;
+export const GUARD_POLL = 3;
+export const GUARD_GRACE = 5;
 
 export const tagLine = (tag) => `${TAG_PREFIX}${tag}`;
 
-export function addTag(command, tag) {
-  return `${tagLine(tag)}\n${GUARD_LINE}${command}`;
+const quote = (text) => `'${text.replace(/'/g, `'\\''`)}'`;
+
+/** The line that starts the guard of a command. dir: the claims directory; poll, grace: whole seconds. */
+export function guardLine(tag, dir, { poll = GUARD_POLL, grace = GUARD_GRACE } = {}) {
+  const claim = quote(`${dir}/${tag}`);
+  // "-$$" is the group led by the shell. Never group 0: that is whatever group the guard happens to
+  // be in, and only the first of the two is known to be the command's. No "--" before it: dash and
+  // BusyBox ash do not take one.
+  const stop = `kill -TERM "-$$"; sleep ${grace}; kill -KILL "-$$"; exit 0`;
+  const loop = `while kill -0 "$$" 2>/dev/null && [ -d "$d" ]; do if [ -e "$d/stop" ]; then ${stop}; fi; sleep ${poll}; done`;
+  const claimIt = `kill -0 "-$$" 2>/dev/null && mkdir "$d" 2>/dev/null && echo "$$" > "$d/pid" || exit 0`;
+  return `( ( trap '' TERM; d=${claim}; ${claimIt}; ${loop} ) </dev/null >/dev/null 2>&1 & )${GUARD_MARK}`;
+}
+
+export function addTag(command, tag, dir, timing) {
+  return `${tagLine(tag)}\n${guardLine(tag, dir, timing)}\n${command}`;
 }
 
 /** Splits the tag lines off a command: { tag, command }. tag is null when there is none. */
@@ -566,124 +595,22 @@ export function splitTag(command) {
   const match = TAG_LINE.exec(text);
   if (!match) return { tag: null, command: text };
   const rest = text.slice(match[0].length);
-  return { tag: match[1].toLowerCase(), command: rest.startsWith(GUARD_LINE) ? rest.slice(GUARD_LINE.length) : rest };
+  const guard = GUARD_LINE.exec(rest);
+  return { tag: match[1].toLowerCase(), command: guard ? rest.slice(guard[0].length) : rest };
 }
 
-/** The command without any tag lines it came with: an identity is never taken from input. */
+/** The command without any tag lines it came with: an id is never taken from input. */
 export function stripTags(command) {
   let text = String(command ?? "");
   for (let split = splitTag(text); split.tag; split = splitTag(text)) text = split.command;
   return text;
 }
 
-/** Should a command about to be launched get a tag? Only when a kill limit is armed for it. */
+/** Should a command about to be launched get a guard? Only when a kill limit is armed for it. */
 export function wantsTag(command, shell, defaults, platform) {
   if (platform === "win32" || !TAG_SHELLS.has(shellName(shell))) return false;
   const directive = parseDirective(command, shell);
   return !directive.off && killArmed(resolveSettings(defaults, directive).settings);
-}
-
-// The tag counts only as the first line of the script the shell was started with (`<shell> … -c
-// <script>`), whole, and followed by the line break as ps shows it: "\012" on macOS, a space in
-// procps, a real newline elsewhere. The same text further down in a command proves nothing.
-function hasTag(argv, tag) {
-  if (typeof argv !== "string" || !tag) return false;
-  const flag = /\s-[A-Za-z]*c\s/.exec(argv);
-  if (!flag) return false;
-  const script = argv.slice(flag.index + flag[0].length);
-  const line = tagLine(tag);
-  return script.startsWith(line) && /^(\s|\\012|$)/.test(script.slice(line.length));
-}
-
-// The tag says what a process was started with; it does not say which process it is. The same text
-// can be run again, and a pid can go to another process without anybody telling. So a kill limit is
-// bound to one process of the operating system: the start time ps reports for it ("birth"), read in
-// the same call as its command line and process group.
-//
-// What remains assumed: a pid is not given to a new process within about two seconds of the start
-// of the process that had it, and not between a check and the signal that follows it.
-const BIRTH_EARLY = 1000;
-const BIRTH_LATE = 2000;
-const BIRTH = String.raw`[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d+\s+\d+:\d+:\d+\s+\d+`;
-const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-
-/** "Thu Nov 19 14:34:54 2026", the local time ps prints with LC_ALL=C, in milliseconds; NaN if not that. */
-export function birthTime(birth) {
-  const match = /^[A-Za-z]{3} ([A-Za-z]{3}) (\d+) (\d+):(\d+):(\d+) (\d+)$/.exec(String(birth ?? ""));
-  const month = match ? MONTHS.indexOf(match[1].toLowerCase()) : -1;
-  if (month < 0) return Number.NaN;
-  return new Date(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5])).getTime();
-}
-
-const oneSpace = (text) => text.trim().replace(/\s+/g, " ");
-
-/** `ps -A -o pid=,pgid=,lstart=` → [{ pid, pgid, birth }]. */
-export function parseProcesses(text) {
-  const line = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${BIRTH})\s*$`);
-  const processes = [];
-  for (const row of String(text).split("\n")) {
-    const match = line.exec(row);
-    if (match) processes.push({ pid: Number(match[1]), pgid: Number(match[2]), birth: oneSpace(match[3]) });
-  }
-  return processes;
-}
-
-/**
- * `ps -ww -o pgid=,lstart=,command= -p <pid>` → { pgid, birth, argv }: one process in one reading.
- * Returns null for text that is not such a line.
- */
-export function parseInspect(text) {
-  const match = new RegExp(String.raw`^\s*(\d+)\s+(${BIRTH})\s+([\s\S]*)$`).exec(String(text).trimEnd());
-  return match ? { pgid: Number(match[1]), birth: oneSpace(match[2]), argv: match[3] } : null;
-}
-
-/**
- * The first look at the process of a tagged command: is it the process that was started for it?
- * seen: what ps says about the pid ({ pgid, birth, argv }), or null when there is no such process.
- * Returns { birth } to bind the kill limit to, or { error }.
- */
-export function captureBirth(seen, rec) {
-  if (!seen) return { error: `process ${rec.pid} was not found` };
-  if (!hasTag(seen.argv, rec.tag)) return { error: `process ${rec.pid} is not the command that was launched` };
-  if (seen.pgid !== rec.pid) return { error: `process ${rec.pid} does not lead its own process group` };
-  // ps cuts the start time down to the second; the command's own start time was taken at the spawn.
-  const late = rec.startedWall - birthTime(seen.birth);
-  if (!(late >= -BIRTH_EARLY && late <= BIRTH_LATE)) return { error: `process ${rec.pid} did not start when the command was started` };
-  return { birth: seen.birth };
-}
-
-/**
- * May SIGTERM go to the process group of this pid? seen: what ps says about the pid now, null when
- * there is no such process, undefined when ps failed. Returns null when it may, else the reason.
- */
-export function verifyLeader(seen, target) {
-  if (!target.tag || !target.birth) return "the command has no kill limit bound to its process";
-  if (seen === undefined) return "the process could not be read";
-  if (seen === null) return `process ${target.pid} was not found`;
-  if (seen.birth !== target.birth) return `pid ${target.pid} now belongs to another process`;
-  if (!hasTag(seen.argv, target.tag)) return `process ${target.pid} is not the command that was launched`;
-  if (seen.pgid !== target.pid) return `process ${target.pid} does not lead its own process group`;
-  return null;
-}
-
-/** The processes of a group, each with its birth: who is in it right now. */
-export function membersOf(processes, pgid) {
-  return processes.filter((proc) => proc.pgid === pgid).map(({ pid, birth }) => ({ pid, birth }));
-}
-
-/**
- * After SIGTERM: may the group be killed? Only when the leader is gone or still the same process,
- * and the group holds a process that was in it when the SIGTERM went out (entry.members): a group id
- * that was given out again has none of those. No clock is involved.
- * Returns null when it may, else the reason to refuse.
- */
-export function verifySurvivors(processes, seen, entry) {
-  if (!Array.isArray(processes)) return "the process list could not be read";
-  if (seen === undefined && processes.some((proc) => proc.pid === entry.pid)) return `process ${entry.pid} could not be checked`;
-  if (seen && (seen.birth !== entry.birth || !hasTag(seen.argv, entry.tag))) return `pid ${entry.pid} now belongs to another process`;
-  const known = (proc) => entry.members.some((member) => member.pid === proc.pid && member.birth === proc.birth);
-  const survivor = processes.some((proc) => proc.pgid === entry.pid && known(proc));
-  return survivor ? null : `no process of group ${entry.pid} is left from before the SIGTERM`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -851,7 +778,7 @@ export function budgetFooter(maxWakes, freeIn) {
 }
 
 export function killNotice(rec, reason) {
-  return `${TAG} ${rec.id} was stopped by the watchdog: ${reason.text}. SIGTERM was sent to process group ${rec.pid}.\n$ ${shortCommand(rec.command)}`;
+  return `${TAG} ${rec.id} is being stopped by the watchdog: ${reason.text}. Its process group gets SIGTERM within a few seconds and SIGKILL ${GUARD_GRACE}s later.\n$ ${shortCommand(rec.command)}`;
 }
 
 export function killOffNotice(rec, why) {
@@ -859,13 +786,11 @@ export function killOffNotice(rec, why) {
 }
 
 export function killRefusedNotice(rec, reason, why) {
-  return `${TAG} ${rec.id} reached its kill limit (${reason.text}) but was NOT killed: ${why}. Automatic kill is now off for this command.\n$ ${shortCommand(rec.command)}`;
+  return `${TAG} ${rec.id} reached its kill limit (${reason.text}) but was NOT stopped: ${why}. Automatic kill is now off for this command.\n$ ${shortCommand(rec.command)}`;
 }
 
-export function escalationNotice(entry, killed, why = "") {
-  return killed
-    ? `${TAG} ${entry.id}: processes of group ${entry.pid} were still alive after SIGTERM, SIGKILL was sent.`
-    : `${TAG} ${entry.id}: processes of group ${entry.pid} may still be alive after SIGTERM, and SIGKILL was not sent: ${why}.`;
+export function stillRunningNotice(rec, waited) {
+  return `${TAG} ${rec.id} was told to stop ${formatDuration(waited)} ago and is still running (pid ${rec.pid}). The watchdog does nothing more about it; stop it yourself if it has to go (kill -KILL -- -${rec.pid}).\n$ ${shortCommand(rec.command)}`;
 }
 
 /** One command for the tool output. */
@@ -878,7 +803,8 @@ export function statusBlock(rec, options = OPTION_DEFAULTS) {
   }
   lines.push(settings);
   const facts = [];
-  if (rec.killed) facts.push("being stopped by the watchdog");
+  if (rec.killed) facts.push("told to stop by the watchdog");
+  else if (rec.tag && !rec.bound && killArmed(rec.settings)) facts.push("kill limits not in force yet: waiting for the guard of the command");
   if (rec.checkAt > rec.clock) facts.push(`snoozed, check in ${formatDuration(rec.checkAt - rec.clock)}`);
   if (rec.episode.reports) {
     facts.push(

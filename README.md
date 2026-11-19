@@ -140,56 +140,59 @@ Off by default. A kill limit is given when the command is launched (or as a defa
 ```
 
 `kill-silence` counts time without a single byte of output (the repetition detector is never used for
-killing); `kill-runtime` counts total runtime. When a limit is reached the watchdog sends `SIGTERM` to
-the command's process group. If processes of that group are still alive at the next check that comes at
-least five seconds later — with the default `tick`, about half a minute — it sends `SIGKILL`. The
-session is told what was done and why.
+killing); `kill-runtime` counts total runtime. When a limit is reached, the command's process group gets
+`SIGTERM` within a few seconds and `SIGKILL` five seconds later. The session is told what was done and
+why, and told again if the command is still running half a minute after that.
 
-Before signalling, the watchdog has to be sure that the process id still belongs to the command and was
-not reused by something else. So a command launched with a kill limit is started with two extra lines in
-front of it:
+### How a command is stopped
+
+The watchdog itself never sends a signal. Telling from outside which process a pid belongs to cannot be
+done safely: pids are given out again, and whatever a process table says is old by the time it is read.
+So a command launched with a kill limit is started with two extra lines in front of it:
 
 ```sh
-# shell-watchdog:3f6c1a52-…      <- a random id, new for every launch
-trap : EXIT                      <- keeps the shell from replacing itself with the last command
+# shell-watchdog:3f6c1a52-…                   <- a random id, new for every launch
+( ( … ) & ) # shell-watchdog guard            <- starts the guard
 # watchdog: kill-silence=30m
 ./flaky-download.sh
 ```
 
-The id ends up in the arguments of the process started for the command. The first time the watchdog
-sees a process with that pid carrying the id as the first line of its script, started at the moment the
-command was started, it notes the start time `ps` reports for it. From then on the kill limit belongs to
-that one process: a signal is sent only to a pid that has the same start time, still carries the id and
-still leads its own process group, all read in a single `ps` call right before the signal. `SIGKILL`
-goes only to a group that still holds a process that was in it when the `SIGTERM` went out. If any of
-this cannot be verified, nothing is signalled and the session is told so.
+The second line starts a *guard*: a small shell loop that lives in the command's own process group.
 
-The second line is needed because a shell replaces itself with the last command of its script, and the
-id would disappear with it; no shell does that while an EXIT trap is set. The trap does nothing and
-leaves the exit status alone, and the command may set an EXIT trap of its own.
+1. The guard claims the id by creating a directory named after it. Only the first to try can, so the
+   same text run a second time, or inside another command, has no guard.
+2. The watchdog checks that the claim was made by the shell of this very command. Only then is the
+   limit in force.
+3. When the limit is reached, the watchdog creates one file in that directory. The guard sees it, and
+   sends `SIGTERM` and then `SIGKILL` to the process group led by its shell — the one it is in itself.
+   (A shell that does not lead a group of its own gets no guard in the first place.)
+
+A guard can only ever stop the group it was started in, and that group cannot be given to anything else
+while the guard is in it. So nothing depends on pids being unique, on clocks, or on `ps`.
+
+The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
+`jobs` and `$!` do not see it, and the exit status, output and traps of the command are what they were.
+It leaves when the command's shell is gone or the command is no longer watched.
 
 What follows from that:
 
 - A kill limit cannot be added to a command that was launched without one. A limit given at launch can
   be changed or switched off while the command runs (`watchdog({id, killSilence: "off"})`).
-- Commands without a kill limit are started exactly as they were written. (A `# shell-watchdog:` line
-  that comes with a command, say copied from `ps`, is removed: an id is never taken from input.)
-- The two lines are visible wherever OpenCode shows the command.
-- A command that replaces its shell itself (`exec ./server`), or removes the trap and ends with an
-  external command, loses the id and is not killed.
-- The limit is dropped, and the session told, when the process cannot be tied to the command: the
-  command was registered more than a minute after its launch, `ps` cannot be read, or the system clock
-  was set back while the command was running.
-- Two things are assumed: a pid is not given to another process within two seconds of the start of the
-  process that had it, nor in the instant between the last check and the signal.
+- Commands without a kill limit are started exactly as they were written. (Tag lines that come with a
+  command, say copied from the list of commands, are removed: an id is never taken from input.)
+- The two lines are visible wherever OpenCode shows the command, and the guard is visible in `ps` as a
+  second process with the command line of the shell. A `pkill -f` that matches that command line takes
+  the guard along, and with it the kill limit.
+- A command that replaces its shell (`exec ./server`) keeps its limit: the guard goes by the pid.
+- If the guard cannot be tied to the command — it did not start, or the id was claimed by something
+  else — the limit is dropped and the session is told.
 - Automatic kill needs settings that were understood completely. A typo, a missing value or the same
   key twice in the directive (or in the plugin options) switches automatic kill off for that command,
   and the first report says what was ignored.
 
-Needs macOS or Linux, a `ps` that understands `-o pid=,pgid=,etime=` and `-o command= -p` (procps, BSD;
-not BusyBox), and one of `sh`, `bash`, `zsh`, `dash`, `ash`, `fish`. Not `ksh` and `mksh`: with an EXIT
-trap set they report a command killed by a signal as an ordinary exit, `mksh` even as success. Processes
-that left the command's process group (`setsid`, daemons) are not reached.
+Needs macOS or Linux and one of `sh`, `bash`, `zsh`, `dash`, `ash` (the shells the guard is tested in).
+The claims are kept in `$XDG_STATE_HOME/opencode-shell-watchdog/claims`, by default under
+`~/.local/state`. Processes that left the command's process group (`setsid`, daemons) are not reached.
 
 ## Time
 
@@ -217,14 +220,15 @@ npm test
 
 | file | what is in it |
 |---|---|
-| `src/core.js` | the logic without I/O: settings, novelty of output, report schedule, texts, kill checks |
+| `src/core.js` | the logic without I/O: settings, novelty of output, report schedule, texts, the guard line |
 | `src/watchdog.js` | registry, tick, delivery and the tool, behind an injectable `io` |
-| `src/io.js` | the real `io`: clocks, output files, `ps`, signals, log |
+| `src/io.js` | the real `io`: clocks, output files, the claims of guards, log |
 | `src/stream.js` | following the server's event stream |
 | `src/index.js` | the plugin entry |
 
-The tests drive the logic with a fake clock, fake files and fake processes, and check the `ps` adapters
-and the tag against real processes in every shell found on the machine.
+The tests drive the logic with a fake clock, fake files and fake processes, and run the guard for real
+in every supported shell found on the machine: that a guarded command behaves like the plain one, that
+the guard stops its own group and nothing else, and that an id works once.
 
 ## License
 

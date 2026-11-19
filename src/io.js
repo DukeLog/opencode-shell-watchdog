@@ -1,28 +1,23 @@
-// Everything the watchdog does to the outside world: clocks, output files, processes, the log.
+// Everything the watchdog does to the outside world: clocks, output files, the claims of guards, the
+// log. It reads the liveness of a pid and never sends a signal.
 
-import { execFile } from "node:child_process";
-import { appendFile, mkdir, open, stat } from "node:fs/promises";
-import { dirname } from "node:path";
-import { parseInspect, parseProcesses } from "./core.js";
+import { appendFile, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
-const PS_TIMEOUT = 5_000;
+/** Where guards claim their ids: a directory only its owner can enter. */
+export function defaultClaims(env = process.env) {
+  const state = env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  return join(state, "opencode-shell-watchdog", "claims");
+}
 
 /**
  * log: path of a JSON-lines log file, or "" for none.
- * ps, psTimeout: the process lister and how long it may take (tests replace them).
+ * claims: the claims directory (tests use their own).
  */
-export function createIO({ log: logFile = "", ps: psCommand = "ps", psTimeout = PS_TIMEOUT } = {}) {
+export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
   let logReady;
-
-  const ps = (args) =>
-    new Promise((resolve, reject) => {
-      execFile(
-        psCommand,
-        args,
-        { env: { ...process.env, LC_ALL: "C" }, timeout: psTimeout, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
-        (error, stdout, stderr) => (error ? reject(Object.assign(error, { stdout, stderr })) : resolve(stdout)),
-      );
-    });
+  const claim = (tag) => join(claims, tag);
 
   return {
     platform: process.platform,
@@ -55,43 +50,62 @@ export function createIO({ log: logFile = "", ps: psCommand = "ps", psTimeout = 
       }
     },
 
-    groupAlive(pgid) {
+    /**
+     * Makes the claims directory. Returns its path for the guard lines, or null when it cannot be
+     * used: then no command gets a kill limit. A path with a line break could not be put in a line.
+     */
+    async prepareClaims() {
+      if (/[\r\n]/.test(claims)) return null;
       try {
-        process.kill(-pgid, 0);
-        return true;
-      } catch (error) {
-        return error?.code === "EPERM";
+        await mkdir(claims, { recursive: true, mode: 0o700 });
+        return claims;
+      } catch {
+        return null;
       }
     },
 
-    signalGroup(pgid, signal) {
-      process.kill(-pgid, signal);
+    /** The pid a guard wrote when it claimed the id, as text; null when nobody has claimed it (yet). */
+    async readClaim(tag) {
+      try {
+        return (await readFile(join(claim(tag), "pid"), "utf8")).trim();
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
     },
 
-    /** Every process: [{ pid, pgid, birth }]. */
-    processes() {
-      return ps(["-A", "-o", "pid=,pgid=,lstart="]).then(parseProcesses);
+    /** Tells the guard that has claimed the id to stop its command. Fails when there is no claim. */
+    async requestStop(tag) {
+      await writeFile(join(claim(tag), "stop"), "");
     },
 
-    /**
-     * One process in a single reading, so that its parts belong together: { pgid, birth, argv }.
-     * null when there is no such process; an error when ps fails or prints something else.
-     */
-    inspect(pid) {
-      return ps(["-ww", "-o", "pgid=,lstart=,command=", "-p", String(pid)]).then(
-        (text) => {
-          const seen = parseInspect(text);
-          if (!seen) throw new Error("ps printed something unexpected");
-          return seen;
-        },
-        (error) => {
-          // ps exits with 1 and prints nothing at all when the pid does not exist. Anything else,
-          // a complaint on stderr included, is a failure and must not pass for "no such process".
-          const silent = String(error?.stdout ?? "").trim() === "" && String(error?.stderr ?? "").trim() === "";
-          if (error?.code === 1 && !error.killed && silent) return null;
-          throw error;
-        },
-      );
+    /** Takes a stop back, in case the guard has not seen it yet. */
+    async cancelStop(tag) {
+      await rm(join(claim(tag), "stop"), { force: true });
+    },
+
+    /** Removes a claim that is not needed any more; its guard, if still there, leaves. */
+    async dropClaim(tag) {
+      await rm(claim(tag), { recursive: true, force: true });
+    },
+
+    /** Removes claims nobody can use any more: older than maxAge and not in `keep`. */
+    async sweepClaims(keep, maxAge) {
+      let names;
+      try {
+        names = await readdir(claims);
+      } catch {
+        return;
+      }
+      for (const name of names) {
+        if (keep.has(name)) continue;
+        try {
+          const info = await stat(claim(name));
+          if (Date.now() - info.mtimeMs > maxAge) await rm(claim(name), { recursive: true, force: true });
+        } catch {
+          // Gone meanwhile, or not ours to remove.
+        }
+      }
     },
 
     log(entry) {
