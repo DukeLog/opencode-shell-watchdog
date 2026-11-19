@@ -813,10 +813,10 @@ test("an event about an earlier start of the same pid does not touch the command
   w.state.done.delete("sh_a");
   w.created("sh_a", { pid: 100, sessionID: null, command: "./a.sh", started: firstStart });
   w.created("sh_c", { pid: 100, command: "./c.sh", started: firstStart - MIN });
-  assert.deepEqual([...w.state.shells.keys()], ["sh_b", "sh_c"], "B is still watched; C is only another record");
+  assert.deepEqual([...w.state.shells.keys()], ["sh_b"], "B is still watched, and nothing older is registered beside it");
+  assert.equal(w.state.done.has("sh_c"), true);
 
   // B's pending SIGKILL survives such an event as well.
-  w.state.shells.delete("sh_c");
   await w.run(a, 2 * MIN);
   assert.deepEqual(w.signals, [[100, "SIGTERM"]]);
   w.exit("sh_b", 100);
@@ -824,6 +824,73 @@ test("an event about an earlier start of the same pid does not touch the command
   assert.equal(w.state.terminating.size, 1);
   await w.run(a, TICK);
   assert.deepEqual(w.signals, [[100, "SIGTERM"], [100, "SIGKILL"]]);
+});
+
+test("events out of order: a command whose pid already has a later start is not registered at all", async () => {
+  for (const next of ["off", "watched"]) {
+    const { w, a } = await started();
+    // A is launched with a kill limit and gets its tag, but the event about it is held up.
+    const first = { command: KILL_COMMAND, shell: "/bin/zsh" };
+    beforeCreate(w.state, w.io, a, first, w.newTag);
+    const firstStart = w.wall;
+    assert.equal(w.state.issued.size, 1);
+
+    // A ends. Ten seconds later its pid belongs to B, which carries A's text in a nested shell, and
+    // B's event comes first.
+    w.wall += 10_000;
+    const nested = `exec /bin/sh -c '${first.command}'`;
+    w.shell("sh_b", { pid: 100, command: next === "off" ? `# watchdog: off\n${nested}` : nested });
+    w.argv.set(100, `/bin/sh -c ${first.command.replace(/\n/g, "\\012")}`);
+    assert.equal(w.state.shells.has("sh_b"), next === "watched");
+
+    // Now A's event arrives, its tag still fresh.
+    w.wall += 20_000;
+    w.created("sh_a", { pid: 100, command: first.command, started: firstStart });
+    assert.equal(w.state.shells.has("sh_a"), false, `${next}: the older start is not registered`);
+    assert.equal(w.state.done.has("sh_a"), true);
+    assert.equal(w.state.shells.has("sh_b"), next === "watched", "and takes nothing from the newer one");
+
+    await w.run(a, 6 * MIN);
+    assert.deepEqual(w.signals, [], `${next}: nobody signals the process of B`);
+  }
+});
+
+test("a tag is good for a moment only: an event that comes a minute late gets no kill limit", async () => {
+  const { w, a } = await started();
+  const event = { command: KILL_COMMAND, shell: "/bin/zsh" };
+  beforeCreate(w.state, w.io, a, event, w.newTag);
+  const startedAt = w.wall;
+  w.wall += 61_000;
+  w.alive.add(100);
+  w.files.set("/out/sh_1", { ino: 100, data: Buffer.alloc(0) });
+  w.created("sh_1", { pid: 100, command: event.command, started: startedAt });
+  const rec = w.state.shells.get("sh_1");
+  assert.equal(rec.tag, null);
+  assert.deepEqual([rec.settings.killSilence, rec.settings.killRuntime], [0, 0]);
+  assert.match(rec.notes.join("; "), /kill limits/);
+  assert.equal(w.state.issued.size, 0);
+
+  // Nor does a command whose start time is unknown.
+  const other = { command: KILL_COMMAND, shell: "/bin/zsh" };
+  beforeCreate(w.state, w.io, a, other, w.newTag);
+  assert.equal(w.state.issued.size, 1);
+  handleEvent(w.state, w.io, {
+    type: "shell.created",
+    location: { directory: "/a" },
+    data: { info: { id: "sh_2", status: "running", command: other.command, shell: "/bin/zsh", file: "/out/sh_2", pid: 200, metadata: { sessionID: "ses_1" } } },
+  });
+  assert.equal(w.state.shells.get("sh_2").tag, null);
+  assert.equal(w.state.shells.get("sh_2").settings.killSilence, 0);
+  assert.equal(w.state.issued.size, 0, "the tag is spent all the same");
+});
+
+test("the memory of pids and tags is bounded", async () => {
+  const { w, a } = await started();
+  for (let i = 0; i < 5200; i++) w.created(`sh_${i}`, { pid: 10_000 + i, sessionID: null, command: "./x.sh" });
+  assert.equal(w.state.pids.size, 5000);
+  await w.run(a, 11 * MIN);
+  assert.equal(w.state.pids.size, 0);
+  assert.equal(w.state.done.size, 0);
 });
 
 test("a replayed event about a start long ago neither revives a command nor takes a pid from a live one", async () => {

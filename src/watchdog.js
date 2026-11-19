@@ -40,7 +40,7 @@ import {
 
 // Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
 // it does not understand.
-const KEY = Symbol.for("opencode-shell-watchdog/state-3");
+const KEY = Symbol.for("opencode-shell-watchdog/state-4");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -53,7 +53,9 @@ const PENDING_CAP = 500;
 const NOTICE_TTL = 60 * 60_000;
 const TERMINATING_TTL = 10 * 60_000;
 const STALE_EVENT = 5 * 60_000;
-const ISSUED_TTL = 10 * 60_000;
+const PID_MEMORY = 2 * STALE_EVENT;
+const PID_CAP = 5000;
+const ISSUED_TTL = 60_000;
 const ISSUED_CAP = 1000;
 const DEFAULT_TICK = 30_000;
 
@@ -62,7 +64,8 @@ export function createState() {
     shells: new Map(), // id -> record of a watched command
     pending: new Map(), // id -> { raw, at }: commands of a location without a live instance
     done: new Map(), // id -> obs: commands that are over, so a late event cannot revive them
-    issued: new Map(), // tag -> obs: tags this plugin wrote into commands that are being launched
+    issued: new Map(), // tag -> wall time: tags this plugin wrote into commands that are being launched
+    pids: new Map(), // pid -> { started, seen }: the latest start known for a pid, of any command
     terminating: new Map(), // id -> permission to send SIGKILL after SIGTERM
     notices: new Map(), // sessionID -> [{ text, at, dir, workspace }]: results of automatic kills
     sessions: new Map(), // sessionID -> { wakes, sentWall, sentObs, missing }
@@ -133,7 +136,7 @@ export function beforeCreate(state, io, inst, event, newTag) {
   if (command !== event.command) event.command = command;
   if (!wantsTag(command, event.shell, inst.settings, io.platform)) return;
   const tag = String(newTag()).toLowerCase();
-  state.issued.set(tag, state.obs);
+  state.issued.set(tag, io.wall());
   if (state.issued.size > ISSUED_CAP) state.issued.delete(state.issued.keys().next().value);
   event.command = addTag(command, tag);
 }
@@ -156,8 +159,17 @@ function onCreated(state, io, info, location) {
   if (typeof id !== "string" || !Number.isInteger(info.pid) || info.pid <= 1) return;
   if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
   const started = Number(info.time?.started);
-  // First of all, and whatever becomes of this command: its pid is not somebody else's any more.
+  // Events may come late and out of order, but a pid has one owner at a time and starts follow each
+  // other. An event about a start that is known to be older than the latest one of its pid is about
+  // a command that is over: it is remembered by id and gets nothing else, least of all a kill limit.
+  const latest = state.pids.get(info.pid);
+  if (latest && started < latest.started) return void bury(state, id);
+  // Otherwise this is the latest start of the pid, whatever becomes of the command: the pid is not
+  // somebody else's any more.
   release(state, io, info.pid, started);
+  state.pids.delete(info.pid);
+  state.pids.set(info.pid, { started, seen: io.wall() });
+  if (state.pids.size > PID_CAP) state.pids.delete(state.pids.keys().next().value);
 
   // Not watched: no session to report to, already over, or an event about a start long ago (a replay,
   // or one held up by a sleeping machine). The id is remembered all the same.
@@ -168,9 +180,12 @@ function onCreated(state, io, info, location) {
     return void bury(state, id);
   }
 
-  // A tag counts once, and only if this plugin wrote it into this launch.
+  // A tag counts once, only if this plugin wrote it into this launch a moment ago, and only for a
+  // command whose start time is known.
   const split = splitTag(info.command);
-  const tag = split.tag !== null && state.issued.delete(split.tag) ? split.tag : null;
+  const issuedAt = split.tag === null ? undefined : state.issued.get(split.tag);
+  if (issuedAt !== undefined) state.issued.delete(split.tag);
+  const tag = issuedAt !== undefined && io.wall() - issuedAt <= ISSUED_TTL && Number.isFinite(started) ? split.tag : null;
   const raw = {
     id,
     sessionID,
@@ -286,7 +301,10 @@ export async function tick(state, io, inst) {
 
 function sweep({ state, io }) {
   for (const [id, at] of state.done) if (state.obs - at > TOMBSTONE_TTL) state.done.delete(id);
-  for (const [tag, at] of state.issued) if (state.obs - at > ISSUED_TTL) state.issued.delete(tag);
+  const wall = io.wall();
+  for (const [tag, at] of state.issued) if (wall - at > ISSUED_TTL) state.issued.delete(tag);
+  // A start is remembered for as long as an event about an earlier one could still be accepted.
+  for (const [pid, entry] of state.pids) if (wall - entry.seen > PID_MEMORY) state.pids.delete(pid);
   for (const [id, entry] of state.pending) if (state.obs - entry.at > PENDING_TTL) onGone(state, id);
   for (const [id, entry] of state.terminating) {
     if (state.obs - entry.termObs <= TERMINATING_TTL) continue;
