@@ -11,6 +11,7 @@ import {
   composeMessage,
   createMemory,
   createRecord,
+  cutBytes,
   decide,
   feed,
   formatDuration,
@@ -29,6 +30,7 @@ import {
   splitLines,
   splitTag,
   statusBlock,
+  stripTags,
   tailLines,
   taint,
   thresholdOf,
@@ -99,9 +101,30 @@ test("directive is applied only for shells where # starts a comment", () => {
 
 test("directive: off, separators and unreadable tokens", () => {
   assert.equal(parseDirective("# watchdog: off\nnpm run dev", "zsh").off, true);
-  const directive = parseDirective("#watchdog: report=5m, Kill-Silence=30m nonsense loop=", "bash");
-  assert.deepEqual(directive.values, { report: "5m", "Kill-Silence": "30m" });
-  assert.equal(directive.errors.length, 2);
+  const directive = parseDirective("#watchdog: report=5m, Kill-Silence=30m nonsense loop= =5m", "bash");
+  assert.deepEqual(directive.values, { report: "5m", "Kill-Silence": "30m", loop: "" }, "a setting without a value is kept to be rejected by name");
+  assert.deepEqual(directive.errors.map((error) => error.raw), ["nonsense", "=5m"]);
+});
+
+test("anything unreadable about a kill limit switches it off instead of leaving the default armed", () => {
+  const defaults = { ...SETTING_DEFAULTS, killRuntime: 2 * 60 * MIN, killSilence: 30 * MIN };
+  const resolve = (line) => resolveSettings(defaults, parseDirective(`# watchdog: ${line}\n./job.sh`, "sh")).settings;
+  const limits = (line) => [resolve(line).killRuntime, resolve(line).killSilence];
+
+  assert.deepEqual(limits("report=5m"), [2 * 60 * MIN, 30 * MIN], "an untouched default stays");
+  assert.deepEqual(limits("kill-runtime="), [0, 30 * MIN], "empty value");
+  assert.deepEqual(limits("kill-runtime"), [0, 30 * MIN], "no value at all");
+  assert.deepEqual(limits("kill-runtime = 1h"), [0, 30 * MIN], "spaces around the equals sign");
+  assert.deepEqual(limits("kill-runtime=soon"), [0, 30 * MIN], "not a duration");
+  assert.deepEqual(limits("kill-runtime=1h killRuntime=3h"), [0, 30 * MIN], "given twice");
+  assert.deepEqual(limits("kill-runtime=bad kill-runtime=3h"), [0, 30 * MIN], "given twice, the first one broken");
+  assert.deepEqual(limits("kill-runtim=1h"), [0, 0], "a misspelt kill setting could have meant either");
+  assert.deepEqual(limits("kill"), [0, 0]);
+  assert.deepEqual(limits("kill-runtime=off"), [0, 30 * MIN], "and the plain way to switch one off");
+
+  const notes = resolveSettings(defaults, parseDirective("# watchdog: kill-runtime=\n./job.sh", "sh")).notes;
+  assert.match(notes.join("; "), /kill-runtime needs a duration/);
+  assert.equal(parseOptions({ killRuntime: "1h", "kill-sillence": "5m" }).settings.killRuntime, 0, "the same for plugin options");
 });
 
 test("settings of a command: directive over defaults, a bad kill value disarms", () => {
@@ -359,36 +382,52 @@ test("changing settings does not restart the report counters", () => {
   assert.equal(decide(rec).stall, false, "still in backoff");
 });
 
-test("tag: added only when a kill limit is armed, never twice", () => {
+test("tag: wanted only when a kill limit is armed and the shell can carry it", () => {
   const defaults = { ...SETTING_DEFAULTS };
   assert.equal(wantsTag("./job.sh", "/bin/zsh", defaults, "darwin"), false, "commands without kill limits stay untouched");
   assert.equal(wantsTag("# watchdog: report=5m\n./job.sh", "/bin/zsh", defaults, "darwin"), false);
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "darwin"), true);
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "win32"), false);
   assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh", "cmd.exe", defaults, "linux"), false);
+  assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.ps1", "/usr/bin/pwsh", defaults, "linux"), false, "exit means something else there");
   assert.equal(wantsTag("# watchdog: off kill-runtime=2h\n./job.sh", "/bin/zsh", defaults, "linux"), false);
   assert.equal(wantsTag("./job.sh", "/bin/bash", { ...defaults, killSilence: 30 * MIN }, "linux"), true, "limit from options");
   assert.equal(wantsTag("# watchdog: kill-silence=off\n./job.sh", "/bin/bash", { ...defaults, killSilence: 30 * MIN }, "linux"), false);
+  assert.equal(wantsTag("# watchdog: kill-runtime=2h\n./job.sh \\", "/bin/zsh", defaults, "linux"), false, "a line continuation would swallow the last line");
+  assert.equal(wantsTag("# watchdog: kill-runtime=2h\necho a\\\\", "/bin/zsh", defaults, "linux"), true, "an escaped backslash is not a continuation");
+});
 
-  const tagged = addTag("# watchdog: kill-runtime=2h\n./job.sh", TAG);
-  assert.equal(wantsTag(tagged, "/bin/zsh", defaults, "darwin"), false);
-  const split = splitTag(tagged);
-  assert.equal(split.tag, TAG);
-  assert.equal(parseDirective(split.command, "/bin/zsh").values["kill-runtime"], "2h", "the directive is still the first line");
+test("tag: first line with the id, last line that keeps the shell alive, both removed again", () => {
+  const command = "# watchdog: kill-runtime=2h\n./job.sh";
+  const tagged = addTag(command, TAG);
+  assert.equal(tagged, `# shell-watchdog:${TAG}\n# watchdog: kill-runtime=2h\n./job.sh\nexit`);
+  assert.deepEqual(splitTag(tagged), { tag: TAG, command });
+  assert.equal(parseDirective(splitTag(tagged).command, "/bin/zsh").values["kill-runtime"], "2h", "the directive is the first line again");
+  assert.deepEqual(splitTag(addTag("./job.sh\nexit", TAG)), { tag: TAG, command: "./job.sh\nexit" }, "an exit of the command itself stays");
+  assert.deepEqual(splitTag(`# shell-watchdog:${TAG.toUpperCase()}\n./job.sh`), { tag: TAG, command: "./job.sh" });
+
   assert.deepEqual(splitTag("./job.sh"), { tag: null, command: "./job.sh" });
   assert.equal(splitTag("echo hi\n# shell-watchdog:" + TAG + "\n").tag, null, "only as the first line");
+  assert.equal(splitTag(`# shell-watchdog:${TAG}`).tag, null, "only as a whole line");
+  assert.equal(stripTags(addTag(addTag(command, TAG), TAG.replace("0a", "0b"))), command, "every tag layer is removed");
+  assert.equal(stripTags(command), command);
 });
 
 test("kill is refused for a pid that is not the tagged command", () => {
   const target = { pid: 4242, tag: TAG };
   const processes = [{ pid: 4242, pgid: 4242, startedWall: 1_000_000 }];
   const argv = `/bin/zsh +o nomatch -c # shell-watchdog:${TAG}\\012./job.sh`;
-  assert.equal(verifyLeader(processes, argv, target), null);
-  assert.equal(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG}\n./job.sh`, target), null, "real newline in ps output");
+  assert.equal(verifyLeader(processes, argv, target), null, "macOS ps: the line break is shown as \\012");
+  assert.equal(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG}\n./job.sh`, target), null, "a real line break");
+  assert.equal(verifyLeader(processes, `sh -c # shell-watchdog:${TAG} ./job.sh exit`, target), null, "procps: the line break is shown as a space");
+  assert.equal(verifyLeader(processes, `sh -c # shell-watchdog:${TAG}`, target), null, "end of the command line");
 
   // The original exited, another group leader got its pid, the exit event is late.
   assert.match(verifyLeader(processes, "/usr/bin/some-daemon --serve", target), /is not the command/);
+  assert.match(verifyLeader(processes, "", target), /is not the command/, "ps found no such process");
   assert.match(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG}ff\\012x`, target), /is not the command/, "the whole tag");
+  assert.match(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG}XYZ\\012x`, target), /is not the command/, "nothing glued to it");
+  assert.match(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG}-x`, target), /is not the command/);
   assert.match(verifyLeader(processes, `/bin/zsh -c # shell-watchdog:${TAG.replace("0a", "0b")}\\012x`, target), /is not the command/);
   assert.match(verifyLeader(processes, argv, { pid: 4242, tag: null }), /not launched with a kill limit/);
   assert.match(verifyLeader(null, argv, target), /could not be read/);
@@ -401,10 +440,17 @@ test("SIGKILL only for a group that predates the SIGTERM", () => {
   const entry = { pid: 4242, tag: TAG, termWall: 2_000_000 };
   const argv = `/bin/zsh -c # shell-watchdog:${TAG}\\012./job.sh`;
   const child = { pid: 5000, pgid: 4242, startedWall: 1_500_000 };
+  const leader = { pid: 4242, pgid: 4242, startedWall: 1_000_000 };
   assert.equal(verifySurvivors([child], "", entry), null, "leader gone, an old child is left");
-  assert.equal(verifySurvivors([{ pid: 4242, pgid: 4242, startedWall: 1_000_000 }, child], argv, entry), null);
+  assert.equal(verifySurvivors([child], null, entry), null, "leader gone: its command line is not needed");
+  assert.equal(verifySurvivors([leader, child], argv, entry), null, "the leader is still the tagged command");
+  assert.equal(verifySurvivors([leader, child], "", entry), null, "the leader exited between the two readings");
+  assert.match(verifySurvivors([leader, child], null, entry), /could not be checked/, "the leader is there and unverified");
   assert.match(verifySurvivors([{ pid: 4242, pgid: 4242, startedWall: 2_500_000 }], "/usr/bin/other", entry), /another process/);
   assert.match(verifySurvivors([{ pid: 5000, pgid: 4242, startedWall: 2_500_000 }], "", entry), /predates/);
+  assert.match(verifySurvivors([{ pid: 5000, pgid: 4242, startedWall: 1_999_000 }], "", entry), /predates/, "ps is exact to a second only");
+  assert.equal(verifySurvivors([{ pid: 5000, pgid: 4242, startedWall: 1_998_000 }], "", entry), null);
+  assert.match(verifySurvivors([], "", entry), /predates/);
   assert.match(verifySurvivors(null, argv, entry), /could not be read/);
 });
 
@@ -418,25 +464,69 @@ test("ps output", () => {
   ]);
 });
 
+const size = (text) => Buffer.byteLength(text, "utf8");
+
+test("texts are cut by bytes, never inside a character", () => {
+  assert.equal(cutBytes("short", 10), "short");
+  assert.equal(cutBytes("abcdefghij", 8), "abcde…");
+  assert.equal(size(cutBytes("ж".repeat(100), 21)), 21, "9 two-byte letters and the ellipsis");
+  assert.equal(cutBytes("😀😀😀", 8), "😀…", "a four-byte character is kept whole or dropped");
+  for (const max of [0, 1, 2, 3, 4, 5, 6, 7]) {
+    const cut = cutBytes("я😀я😀", max);
+    assert.ok(size(cut) <= max, `${max}: ${size(cut)} bytes`);
+    assert.doesNotMatch(cut, /�/);
+  }
+});
+
 test("report text is bounded", () => {
-  assert.equal(shortCommand(`# shell-watchdog:${TAG}\n# watchdog: report=5m\n./a.sh\n./b.sh`), "./a.sh … (+1 more lines)");
-  assert.ok(shortCommand("x".repeat(5000)).length <= 200);
+  assert.equal(shortCommand(`# shell-watchdog:${TAG}\n# watchdog: report=5m\n./a.sh\n./b.sh\nexit`), "./a.sh … (+1 more lines)");
+  assert.equal(shortCommand(addTag("./job.sh", TAG)), "./job.sh", "neither the tag nor its last line is shown");
+  assert.ok(size(shortCommand("x".repeat(5000))) <= 200);
+  assert.ok(size(shortCommand(`${"я".repeat(5000)}\nmore`)) <= 200);
   assert.equal(shortCommand(""), "(empty command)");
 
   const tail = tailLines(Array.from({ length: 100 }, (_, i) => `line ${i} ${"y".repeat(400)}`).join("\n"), 15);
   assert.ok(tail.length >= 1 && tail.length <= 15);
-  assert.ok(tail.every((line) => line.length <= 200));
-  assert.ok(tail.join("\n").length <= 1500);
+  assert.ok(tail.every((line) => size(line) <= 200));
+  assert.ok(size(tail.join("\n")) <= 1500);
   assert.match(tail.at(-1), /^line 99 /);
   assert.deepEqual(tailLines("a\nb", 0), []);
   assert.deepEqual(tailLines("start\nwaiting\nwaiting\nwaiting\ndone\n", 15), ["start", "waiting (x3)", "done"]);
 
+  const wide = tailLines(Array.from({ length: 100 }, (_, i) => `строка ${i} ${"ы".repeat(400)}`).join("\n"), 15);
+  assert.ok(wide.length >= 1);
+  assert.ok(wide.every((line) => size(line) <= 200), "a line limit is bytes, not letters");
+  assert.ok(size(wide.join("\n")) <= 1500);
+  const repeated = tailLines(`${"ы".repeat(400)}\n`.repeat(7), 15);
+  assert.equal(repeated.length, 1);
+  assert.ok(size(repeated[0]) <= 200 && repeated[0].endsWith(" (x7)"));
+});
+
+test("a message keeps to its size limit and names what it leaves out", () => {
   const blocks = Array.from({ length: 40 }, (_, i) => ({ id: `sh_${i}`, text: "z".repeat(400) }));
   const message = composeMessage(blocks, ["notice"], "footer");
-  assert.ok(message.length <= MESSAGE_CAP + 600);
-  assert.match(message, /also due, see the watchdog tool: sh_\d+/);
+  assert.ok(size(message) <= MESSAGE_CAP);
+  assert.match(message, /Not shown, see the watchdog tool: also due: sh_\d+/);
   assert.ok(message.startsWith("notice"));
   assert.ok(message.endsWith("footer"));
+
+  // Notices come first; those that do not fit are counted, and so are the commands.
+  const notices = Array.from({ length: 30 }, (_, i) => `notice ${i} ${"ж".repeat(200)}`);
+  const crowded = composeMessage(blocks, notices, "footer");
+  assert.ok(size(crowded) <= MESSAGE_CAP, `${size(crowded)} bytes`);
+  assert.match(crowded, /\d+ more notices about automatic kills/);
+  assert.ok(crowded.endsWith("footer"));
+  assert.doesNotMatch(crowded, /�/);
+
+  // One block that is too large by itself is cut, not dropped.
+  const huge = composeMessage([{ id: "sh_1", text: "я".repeat(20_000) }], [], "footer");
+  assert.ok(size(huge) <= MESSAGE_CAP);
+  assert.ok(huge.startsWith("яяя") && huge.endsWith("footer"));
+
+  // A long list of skipped ids is cut as well.
+  const many = Array.from({ length: 400 }, (_, i) => ({ id: `sh_${"0".repeat(26)}${i}`, text: "z".repeat(3000) }));
+  assert.ok(size(composeMessage(many, [], "")) <= MESSAGE_CAP);
+  assert.equal(composeMessage([], ["only a notice"], ""), "only a notice");
 });
 
 test("report and status texts", () => {

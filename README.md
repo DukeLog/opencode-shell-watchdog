@@ -105,6 +105,8 @@ The agent gets one tool. It only sees the commands of its own session.
 | `watchdog({id, snooze: "30m"})` | no reports for 30 minutes, then one check |
 | `watchdog({id, off: true})` | stop watching it |
 
+A call is applied as a whole or not at all: one bad value and nothing changes.
+
 ## What a report means
 
 - **no output for N** — the output file has not grown.
@@ -112,14 +114,16 @@ The agent gets one tool. It only sees the commands of its own session.
   (`loop=exact`), or differs from an earlier one only in numbers (`loop=shape`).
 - **status** — a periodic report you asked for with `report=`.
 
-Reports go only to a session that is not busy, and all due commands of a session travel in one message.
-While the agent is in the middle of a turn nothing is queued behind it; the report arrives when the turn
-is over and the command is still stalled.
+All due commands of a session travel in one message of at most 6 KB. The watchdog asks whether the
+session is busy right before it sends, and holds the report back while it is: nothing piles up behind a
+long turn, and the report arrives when the turn is over and the command is still stalled. The check and
+the send are two steps, so a turn that starts exactly in between gets the report queued behind it.
 
 To keep a hung command from costing a turn every few minutes:
 
 - reports about the same stall back off (5m, then 10m, 20m, 40m later) and stop after `maxReports`.
-  New output starts a new stall with a fresh count;
+  The count starts again when the command makes progress in the sense of its `loop` setting: with
+  `exact`, a line it has not printed recently; with `off`, any output;
 - a command that keeps going quiet and then prints again teaches the watchdog its rhythm: after two such
   recoveries the threshold for that command is raised to twice the typical gap, and falls back after a
   few hours;
@@ -137,18 +141,38 @@ Off by default. A kill limit is given when the command is launched (or as a defa
 
 `kill-silence` counts time without a single byte of output (the repetition detector is never used for
 killing); `kill-runtime` counts total runtime. When a limit is reached the watchdog sends `SIGTERM` to
-the command's process group and, if the group is still alive a few seconds later, `SIGKILL`. The session
-is told what was done and why.
+the command's process group. If the group is still alive at the next check that comes at least five
+seconds later — with the default `tick`, about half a minute — it sends `SIGKILL`. The session is told
+what was done and why.
 
-A kill limit cannot be added to a command that is already running, and here is why. Before signalling,
-the watchdog has to be sure that the process id still belongs to the command and was not reused. So a
-command launched with a kill limit gets one extra first line, `# shell-watchdog:<random id>`. That line
-ends up in the arguments of exactly the process started for the command, and the signal is sent only if
-it is still there. If that cannot be verified, nothing is signalled and the session is told so.
-Commands without a kill limit are never modified.
+Before signalling, the watchdog has to be sure that the process id still belongs to the command and was
+not reused by something else. So a command launched with a kill limit is started with two extra lines:
 
-POSIX only (macOS, Linux). Processes that left the command's process group (`setsid`, daemons) are not
-reached.
+```sh
+# shell-watchdog:3f6c1a52-…      <- first line: a random id, new for every launch
+# watchdog: kill-silence=30m
+./flaky-download.sh
+exit                             <- last line
+```
+
+The id ends up in the arguments of exactly the process started for the command, and a signal is sent
+only while `ps` still shows it there. The last line is needed because a shell replaces itself with the
+last command of its script, and the id would disappear with it; `exit` without an argument passes on the
+status of the command before it, so the exit code does not change. If the id cannot be verified,
+nothing is signalled and the session is told so.
+
+What follows from that:
+
+- A kill limit cannot be added to a command that was launched without one. A limit given at launch can
+  be changed or switched off while the command runs (`watchdog({id, killSilence: "off"})`).
+- Commands without a kill limit are started exactly as they were written.
+- A command that replaces its shell itself (`exec ./server`) loses the id and is not killed.
+- Anything unreadable in a kill setting (`kill-runtime=`, a typo, the same key twice) switches that limit
+  off rather than leaving a default limit armed.
+
+Needs macOS or Linux, a `ps` that understands `-o pid=,pgid=,etime=` and `-o command= -p` (procps, BSD),
+and one of `sh`, `bash`, `zsh`, `dash`, `ash`, `ksh`, `mksh`, `fish`. Processes that left the command's
+process group (`setsid`, daemons) are not reached.
 
 ## Time
 
@@ -174,9 +198,16 @@ count as silence. Durations in reports are therefore approximate.
 npm test
 ```
 
-`src/core.js` is the logic without I/O (settings, novelty of output, schedule, texts), `src/watchdog.js`
-the registry, tick and delivery behind an injectable `io`, `src/index.js` the plugin entry. The tests
-drive all of it with a fake clock, fake files and fake processes.
+| file | what is in it |
+|---|---|
+| `src/core.js` | the logic without I/O: settings, novelty of output, report schedule, texts, kill checks |
+| `src/watchdog.js` | registry, tick, delivery and the tool, behind an injectable `io` |
+| `src/io.js` | the real `io`: clocks, output files, `ps`, signals, log |
+| `src/stream.js` | following the server's event stream |
+| `src/index.js` | the plugin entry |
+
+The tests drive the logic with a fake clock, fake files and fake processes, and check the `ps` adapters
+and the tag against real processes in every shell found on the machine.
 
 ## License
 

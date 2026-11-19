@@ -8,6 +8,7 @@ import {
   DAY,
   KILL_SETTINGS,
   absorb,
+  addTag,
   applySettings,
   budgetFooter,
   commit,
@@ -29,13 +30,17 @@ import {
   splitLines,
   splitTag,
   statusBlock,
+  stripTags,
   tailLines,
   taint,
   verifyLeader,
   verifySurvivors,
+  wantsTag,
 } from "./core.js";
 
-const KEY = Symbol.for("opencode-shell-watchdog/v1");
+// Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
+// it does not understand.
+const KEY = Symbol.for("opencode-shell-watchdog/state-2");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -47,6 +52,8 @@ const PENDING_TTL = 60 * 60_000;
 const PENDING_CAP = 500;
 const NOTICE_TTL = 60 * 60_000;
 const TERMINATING_TTL = 10 * 60_000;
+const ISSUED_TTL = 10 * 60_000;
+const ISSUED_CAP = 1000;
 const DEFAULT_TICK = 30_000;
 
 export function createState() {
@@ -54,6 +61,7 @@ export function createState() {
     shells: new Map(), // id -> record of a watched command
     pending: new Map(), // id -> { raw, at }: commands of a location without a live instance
     done: new Map(), // id -> obs: commands that are over, so a late event cannot revive them
+    issued: new Map(), // tag -> obs: tags this plugin wrote into commands that are being launched
     terminating: new Map(), // id -> permission to send SIGKILL after SIGTERM
     notices: new Map(), // sessionID -> [{ text, at, dir, workspace }]: results of automatic kills
     sessions: new Map(), // sessionID -> { wakes, sentWall, missing }
@@ -106,6 +114,26 @@ function tickOf(state) {
 
 const bury = (state, id) => state.done.set(id, state.obs);
 
+// Every instance has its own log file: an entry about a command belongs to the log of its owner,
+// whichever instance happened to see the event or run the tick.
+function log(state, io, target, entry) {
+  (ownerOf(state, target)?.io ?? io).log(entry);
+}
+
+/**
+ * The `create.before` hook: a command launched with a kill limit gets a tag of its own. Tags that
+ * came with the command are dropped first; only a tag issued here is ever trusted.
+ */
+export function beforeCreate(state, io, inst, event, newTag) {
+  if (inst.disposed || typeof event?.command !== "string") return;
+  const command = stripTags(event.command);
+  if (!wantsTag(command, event.shell, inst.settings, io.platform)) return;
+  const tag = String(newTag()).toLowerCase();
+  state.issued.set(tag, state.obs);
+  if (state.issued.size > ISSUED_CAP) state.issued.delete(state.issued.keys().next().value);
+  event.command = addTag(command, tag);
+}
+
 export function handleEvent(state, io, event) {
   const data = event?.data ?? {};
   switch (event?.type) {
@@ -128,13 +156,15 @@ function onCreated(state, io, info, location) {
   if (typeof location?.directory !== "string") return;
   if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
 
-  const { tag, command } = splitTag(info.command);
+  // A tag counts once, and only if this plugin wrote it into this launch.
+  const split = splitTag(info.command);
+  const tag = split.tag !== null && state.issued.delete(split.tag) ? split.tag : null;
   const raw = {
     id,
     sessionID,
     pid: info.pid,
     file: info.file,
-    command,
+    command: stripTags(info.command),
     tag,
     shell: String(info.shell ?? ""),
     cwd: info.cwd,
@@ -155,10 +185,10 @@ function activate(state, io, inst, raw) {
   const { settings, notes } = resolveSettings(inst.settings, directive);
   if (killArmed(settings) && !raw.tag) {
     for (const key of KILL_SETTINGS) settings[key] = 0;
-    notes.push("kill limits (automatic kill needs a POSIX system and sh, bash, zsh, dash, ksh or fish)");
+    notes.push("kill limits (automatic kill needs macOS or Linux, one of sh, bash, zsh, dash, ksh, fish, and a command that does not end with a backslash)");
   }
   state.shells.set(raw.id, createRecord(raw, settings, notes));
-  io.log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
+  (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
 }
 
 function onGone(state, id) {
@@ -222,11 +252,12 @@ export async function tick(state, io, inst) {
 
 function sweep({ state, io }) {
   for (const [id, at] of state.done) if (state.obs - at > TOMBSTONE_TTL) state.done.delete(id);
+  for (const [tag, at] of state.issued) if (state.obs - at > ISSUED_TTL) state.issued.delete(tag);
   for (const [id, entry] of state.pending) if (state.obs - entry.at > PENDING_TTL) onGone(state, id);
   for (const [id, entry] of state.terminating) {
     if (state.obs - entry.termObs <= TERMINATING_TTL) continue;
+    log(state, io, entry, { kind: "escalation-expired", id });
     state.terminating.delete(id);
-    io.log({ kind: "escalation-expired", id });
   }
   for (const [sessionID, list] of state.notices) {
     const fresh = list.filter((notice) => state.obs - notice.at <= NOTICE_TTL);
@@ -277,59 +308,65 @@ async function observe({ state, io, held, delta, gap }) {
     if (!io.alive(rec.pid)) {
       // The exit event normally arrives first; this covers a lost one.
       if (++rec.missing >= 2) {
+        log(state, io, rec, { kind: "vanished", id: rec.id, pid: rec.pid });
         onGone(state, rec.id);
-        io.log({ kind: "vanished", id: rec.id, pid: rec.pid });
       }
       continue;
     }
     rec.missing = 0;
 
-    const valid = () => state.shells.get(rec.id) === rec;
-    let grew = false;
-    let lines = [];
-    let sampled = false;
+    // The record takes an observation only as a whole: nothing of a failed or outdated one is kept,
+    // so the same bytes are simply read again on the next pass.
+    const rev = rec.rev;
+    const current = () => state.shells.get(rec.id) === rec && rec.rev === rev;
+    let seen;
     try {
       const info = await io.stat(rec.file);
       if (!held()) return;
-      if (!valid()) continue;
-      if ((rec.ino !== null && info.ino !== rec.ino) || info.size < rec.offset) {
-        // Another file, or a truncated one: read it from the start.
-        rec.offset = 0;
-        grew = true;
-      }
-      if (info.size !== rec.size) grew = true;
-      rec.ino = info.ino;
-      rec.size = info.size;
-      if (grew && info.size > rec.offset) {
-        let start = rec.offset;
+      if (!current()) continue;
+      // Another file, or a truncated one: read it from the start.
+      const restart = (rec.ino !== null && info.ino !== rec.ino) || info.size < rec.offset;
+      seen = { ino: info.ino, size: info.size, offset: restart ? 0 : rec.offset, grew: restart || info.size !== rec.size, lines: [], sampled: false };
+      if (seen.grew && info.size > seen.offset) {
+        let start = seen.offset;
         if (info.size - start > MAX_READ) {
           start = info.size - MAX_READ;
-          sampled = true;
+          seen.sampled = true;
         }
         const buffer = await io.read(rec.file, start, info.size - start);
         if (!held()) return;
-        if (!valid()) continue;
-        const taken = takeLines(buffer, sampled);
-        rec.offset = start + taken.consumed;
-        lines = splitLines(taken.text);
+        if (!current()) continue;
+        const taken = takeLines(buffer, seen.sampled);
+        seen.offset = start + taken.consumed;
+        seen.lines = splitLines(taken.text);
       }
     } catch (error) {
       if (!held()) return;
-      if (valid()) setObserve(rec, errorCode(error));
+      if (current()) setObserve(rec, errorCode(error));
       continue;
     }
+    if (!ownerOf(state, rec)) {
+      taint(rec);
+      continue;
+    }
+    rec.ino = seen.ino;
+    rec.size = seen.size;
+    rec.offset = seen.offset;
     setObserve(rec, "ok");
-    absorb(rec, { grew, lines, sampled });
+    absorb(rec, seen);
   }
 }
 
+/**
+ * The process table and the command line of one pid, read independently: one may fail without
+ * spoiling the other. processes: array or null; argv: string ("" when there is no such process) or null.
+ */
 async function readProcesses(io, pid) {
-  try {
-    const [processes, argv] = await Promise.all([io.processes(), io.argv(pid)]);
-    return { processes, argv };
-  } catch {
-    return { processes: null, argv: null };
-  }
+  const [processes, argv] = await Promise.allSettled([io.processes(), io.argv(pid)]);
+  return {
+    processes: processes.status === "fulfilled" && Array.isArray(processes.value) ? processes.value : null,
+    argv: argv.status === "fulfilled" && typeof argv.value === "string" ? argv.value : null,
+  };
 }
 
 function disarm(state, rec) {
@@ -359,7 +396,7 @@ async function enforce({ state, io, held }) {
     if (refusal) {
       disarm(state, rec);
       notify(state, rec, killRefusedNotice(rec, reason, refusal));
-      io.log({ kind: "kill-refused", id: rec.id, pid: rec.pid, why: refusal });
+      log(state, io, rec, { kind: "kill-refused", id: rec.id, pid: rec.pid, why: refusal });
       continue;
     }
     rec.killed = { setting: reason.setting, text: reason.text };
@@ -375,7 +412,7 @@ async function enforce({ state, io, held }) {
       termWall: io.wall(),
     });
     notify(state, rec, killNotice(rec, reason));
-    io.log({ kind: "kill", id: rec.id, pid: rec.pid, why: reason.text });
+    log(state, io, rec, { kind: "kill", id: rec.id, pid: rec.pid, why: reason.text });
   }
 }
 
@@ -403,7 +440,7 @@ async function escalate({ state, io, held }) {
       }
     }
     notify(state, entry, escalationNotice(entry, !refusal, refusal ?? ""));
-    io.log({ kind: refusal ? "escalation-refused" : "escalation", id: entry.id, pid: entry.pid, why: refusal });
+    log(state, io, entry, { kind: refusal ? "escalation-refused" : "escalation", id: entry.id, pid: entry.pid, why: refusal });
   }
 }
 
@@ -452,7 +489,8 @@ async function deliver(run) {
   await Promise.allSettled([...batches].map(([sessionID, batch]) => deliverSession(run, sessionID, batch)));
 }
 
-async function deliverSession({ state, io, held }, sessionID, { owner, items }) {
+async function deliverSession({ state, io: tickIO, held }, sessionID, { owner, items }) {
+  const io = owner.io ?? tickIO;
   const options = owner.options;
   const book = bookOf(state, sessionID);
   const budgetLeft = () => options.maxWakes === 0 || book.wakes.length < options.maxWakes;
@@ -556,19 +594,11 @@ export async function toolCall(state, io, inst, input, sessionID) {
   const own = rec?.sessionID === sessionID ? rec : null;
   const entry = state.terminating.get(id);
   const ownEntry = entry?.sessionID === sessionID ? entry : null;
-
-  if (args.off === true) {
-    if (ownEntry) state.terminating.delete(id);
-    if (own) {
-      onGone(state, id);
-      return `Stopped watching ${id}: no more reports and no automatic kill for it.`;
-    }
-    if (ownEntry) return `${id}: the pending SIGKILL was cancelled.`;
-  }
-  if (!own) {
+  if (!own && !ownEntry) {
     return `${id} is not a watched command of this session (it may have finished, or it was launched with "# watchdog: off").\n\n${listText(state, inst, sessionID)}`;
   }
 
+  // The whole call is checked before any part of it is applied.
   const errors = [];
   const settingInput = {};
   for (const key of given) {
@@ -584,23 +614,31 @@ export async function toolCall(state, io, inst, input, sessionID) {
     snooze = parseDuration(args.snooze);
     if (snooze === undefined) errors.push(`snooze needs a duration like 30m, or off, not "${args.snooze}"`);
   }
-  if (KILL_SETTINGS.some((key) => patch[key] > 0) && !own.tag) {
+  if (own && KILL_SETTINGS.some((key) => patch[key] > 0) && !own.tag) {
     errors.push(
-      'a kill limit cannot be added to a running command: it must be given when the command is launched, as its first line, e.g. "# watchdog: kill-runtime=2h"',
+      'a kill limit cannot be added to a command that was launched without one: give it at launch, as the first line of the command, e.g. "# watchdog: kill-runtime=2h"',
     );
   }
-  const options = (ownerOf(state, own) ?? inst).options;
-  if (errors.length) return `Nothing was changed: ${errors.join("; ")}.\n\n${statusBlock(own, options)}`;
+  const options = (ownerOf(state, own ?? ownEntry) ?? inst).options;
+  const status = () => (own ? statusBlock(own, options) : `${id} has finished; a SIGKILL for what is left of its process group is pending.`);
+  if (errors.length) return `Nothing was changed: ${errors.join("; ")}.\n\n${status()}`;
 
-  if (Object.keys(patch).length) {
-    applySettings(own, patch);
-    // Switching off the limit that fired withdraws the permission to escalate.
-    if (ownEntry && patch[ownEntry.setting] === 0) state.terminating.delete(id);
+  if (args.off === true) {
+    if (ownEntry) state.terminating.delete(id);
+    log(state, io, own ?? ownEntry, { kind: "tool", id, off: true });
+    if (!own) return `${id}: the pending SIGKILL was cancelled.`;
+    onGone(state, id);
+    return `Stopped watching ${id}: no more reports and no automatic kill for it.`;
   }
+  // Switching off the limit that fired withdraws the permission to escalate.
+  if (ownEntry && patch[ownEntry.setting] === 0) state.terminating.delete(id);
+  if (!own) return state.terminating.has(id) ? status() : `${id}: the pending SIGKILL was cancelled.`;
+
+  if (Object.keys(patch).length) applySettings(own, patch);
   if (snooze !== undefined) {
     own.checkAt = snooze > 0 ? own.clock + snooze : 0;
     own.rev += 1;
   }
-  io.log({ kind: "tool", id, patch, snooze });
+  log(state, io, own, { kind: "tool", id, patch, snooze });
   return statusBlock(own, options);
 }

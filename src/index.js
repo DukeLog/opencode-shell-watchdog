@@ -5,31 +5,25 @@
 // itself, tells the session what it sees. The agent decides what to do; nothing is killed unless a kill
 // limit was given for that command when it was launched.
 
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, open, stat } from "node:fs/promises";
-import { dirname } from "node:path";
-import { addTag, parseOptions, parseProcesses, wantsTag } from "./core.js";
-import { addInstance, handleEvent, removeInstance, sharedState, tick, toolCall } from "./watchdog.js";
+import { parseOptions } from "./core.js";
+import { createIO } from "./io.js";
+import { follow } from "./stream.js";
+import { addInstance, beforeCreate, handleEvent, removeInstance, sharedState, tick, toolCall } from "./watchdog.js";
 
 const EVENTS = ["shell.created", "shell.exited", "shell.deleted", "session.deleted"];
-const PS_TIMEOUT = 5_000;
 
-const TOOL_DESCRIPTION = `Watchdog for shell commands that keep running.
+// A tool catalog may show only the first paragraph of a description, so everything the model has to
+// know before it launches a command is in that paragraph.
+const TOOL_DESCRIPTION = `Watchdog for shell commands you leave running: when one prints nothing for a while or keeps repeating the same output, a "[shell-watchdog]" message arrives in this session and you decide whether to wait or stop it (nothing is killed automatically unless a kill limit was set at launch). To set limits for one command at launch, make its first line a comment, e.g. "# watchdog: report=5m silence=off" for a status report every 5 minutes; keys: silence, loop, report, kill-silence, kill-runtime; "# watchdog: off" launches it unwatched. Call this tool with no arguments to list the watched commands of this session, or with "id" and settings to change the limits of a running command.
 
-Every shell command you start is watched. When one prints nothing for a while, or keeps printing lines it has printed before, a "[shell-watchdog]" message arrives in this session with what the command is doing. You then decide: keep waiting, look closer, or stop it. The watchdog never kills a command unless a kill limit was given at launch.
-
-Call this tool with no arguments to list the watched commands of this session, with "id" to see one, or with "id" and settings to change them:
+Settings:
 - silence: report when nothing happens for this long ("5m", "90s", "1h30m"); "off" stops stall reports
 - loop: what counts as "something happened" - "exact" (a line not printed recently), "shape" (same, ignoring numbers), "off" (any output)
-- report: a status report at this interval whatever the state ("5m"); "off" to stop
+- report: a status report at this interval whatever the command is doing; "off" to stop
 - snooze: no reports for this long, then one check
 - off: true - stop watching the command
-
-Settings can also be given at launch by making the first line of the command a comment:
-  # watchdog: report=5m silence=10m
-  ./long-task.sh
-Kill limits (kill-silence, kill-runtime) work only this way, e.g. "# watchdog: kill-runtime=2h". "# watchdog: off" starts a command unwatched.`;
+- kill-silence, kill-runtime: stop the command after this long without output / of runtime. They can only be given at launch ("# watchdog: kill-runtime=2h"); this tool can change or switch off a limit given that way.`;
 
 const TOOL_INPUT = {
   type: "object",
@@ -46,172 +40,87 @@ const TOOL_INPUT = {
   additionalProperties: false,
 };
 
-function createIO(logFile) {
-  let logReady;
-  return {
-    platform: process.platform,
-    mono: () => performance.now(),
-    wall: () => Date.now(),
-
-    async stat(file) {
-      const info = await stat(file);
-      return { size: info.size, ino: info.ino };
-    },
-
-    async read(file, start, length) {
-      const handle = await open(file, "r");
-      try {
-        const buffer = Buffer.allocUnsafe(length);
-        const { bytesRead } = await handle.read(buffer, 0, length, start);
-        return buffer.subarray(0, bytesRead);
-      } finally {
-        await handle.close();
-      }
-    },
-
-    // EPERM means the process exists and belongs to someone else.
-    alive(pid) {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch (error) {
-        return error?.code === "EPERM";
-      }
-    },
-
-    groupAlive(pgid) {
-      try {
-        process.kill(-pgid, 0);
-        return true;
-      } catch (error) {
-        return error?.code === "EPERM";
-      }
-    },
-
-    signalGroup(pgid, signal) {
-      process.kill(-pgid, signal);
-    },
-
-    processes() {
-      return ps(["-A", "-o", "pid=,pgid=,etime="]).then((text) => parseProcesses(text, Date.now()));
-    },
-
-    argv(pid) {
-      return ps(["-ww", "-o", "command=", "-p", String(pid)]);
-    },
-
-    log(entry) {
-      if (!logFile) return;
-      logReady ??= mkdir(dirname(logFile), { recursive: true }).catch(() => {});
-      void logReady.then(() => appendFile(logFile, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`)).catch(() => {});
-    },
-  };
-}
-
-function ps(args) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      "ps",
-      args,
-      { env: { ...process.env, LC_ALL: "C" }, timeout: PS_TIMEOUT, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout) => (error ? reject(error) : resolve(stdout)),
-    );
-  });
-}
-
-const sleep = (ms, signal) =>
-  new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-    signal.addEventListener("abort", () => (clearTimeout(timer), resolve()), { once: true });
-  });
-
-async function follow(ctx, signal, onEvent, io) {
-  let delay = 1000;
-  while (!signal.aborted) {
-    try {
-      for await (const event of ctx.event.subscribe({ types: EVENTS, signal })) {
-        delay = 1000;
-        onEvent(event);
-      }
-    } catch (error) {
-      if (signal.aborted) return;
-      io.log({ kind: "subscribe-error", error: String(error?.message ?? error) });
-    }
-    if (signal.aborted) return;
-    // The stream ended while we are alive: commands started meanwhile go unseen, so come back fast.
-    await sleep(delay, signal);
-    delay = Math.min(delay * 2, 30_000);
-  }
-}
-
 export default {
   id: "shell-watchdog",
 
   async setup(ctx) {
     const { options, settings, errors } = parseOptions(ctx.options);
-    const io = createIO(options.log);
+    const io = createIO({ log: options.log });
     for (const error of errors) console.warn(`[shell-watchdog] option ignored: ${error}`);
 
     const state = sharedState();
     const inst = {
       ctx,
+      io,
       options,
       settings,
       dir: ctx.location?.directory,
       workspace: ctx.location?.workspaceID ?? null,
       disposed: false,
     };
-    addInstance(state, io, inst);
-    io.log({ kind: "setup", dir: inst.dir, version: ctx.app?.version ?? null, optionErrors: errors });
-
     const controller = new AbortController();
     const registrations = [];
+    let timer;
 
-    void follow(
-      ctx,
-      controller.signal,
-      (event) => {
-        try {
-          handleEvent(state, io, event);
-        } catch (error) {
-          io.log({ kind: "event-error", type: event?.type, error: String(error?.message ?? error) });
-        }
-      },
-      io,
-    );
-
-    const timer = setInterval(() => {
-      tick(state, io, inst).catch((error) => io.log({ kind: "tick-error", error: String(error?.stack ?? error) }));
-    }, options.tick);
-    timer.unref?.();
-
-    // A command launched with a kill limit gets a unique first line. It ends up in the argv of exactly
-    // that process, which is what later proves a pid still is the command and not a reused number.
-    registrations.push(
-      await ctx.shell.hook("create.before", (event) => {
-        if (inst.disposed || typeof event?.command !== "string") return;
-        if (wantsTag(event.command, event.shell, settings, io.platform)) event.command = addTag(event.command, randomUUID());
-      }),
-    );
-
-    registrations.push(
-      await ctx.tool.transform((editor) => {
-        editor.add({
-          name: "watchdog",
-          description: TOOL_DESCRIPTION,
-          input: TOOL_INPUT,
-          execute: async (input, context) => ({ content: await toolCall(state, io, inst, input, context.sessionID) }),
-        });
-      }),
-    );
-
-    return async () => {
+    const cleanup = async () => {
       removeInstance(state, inst);
       clearInterval(timer);
       controller.abort();
-      for (const registration of registrations) await registration?.dispose?.().catch(() => {});
+      for (const registration of registrations.splice(0)) {
+        await Promise.resolve()
+          .then(() => registration?.dispose?.())
+          .catch(() => {});
+      }
       io.log({ kind: "cleanup", dir: inst.dir });
     };
+
+    try {
+      // A command launched with a kill limit gets a unique first line. It ends up in the argv of
+      // exactly that process, which later proves that a pid still is the command and not a reused
+      // number.
+      registrations.push(await ctx.shell.hook("create.before", (event) => beforeCreate(state, io, inst, event, randomUUID)));
+
+      registrations.push(
+        await ctx.tool.transform((editor) => {
+          editor.add({
+            name: "watchdog",
+            description: TOOL_DESCRIPTION,
+            input: TOOL_INPUT,
+            // Keep it where the model sees it without searching: the description is how the model
+            // learns the launch-time syntax.
+            options: { pinned: true },
+            execute: async (input, context) => ({ content: await toolCall(state, io, inst, input, context.sessionID) }),
+          });
+        }),
+      );
+
+      addInstance(state, io, inst);
+      io.log({ kind: "setup", dir: inst.dir, version: ctx.app?.version ?? null, optionErrors: errors });
+
+      void follow(
+        ctx,
+        EVENTS,
+        controller.signal,
+        (event) => {
+          try {
+            handleEvent(state, io, event);
+          } catch (error) {
+            io.log({ kind: "event-error", type: event?.type, error: String(error?.message ?? error) });
+          }
+        },
+        (error) => io.log({ kind: "subscribe-error", error: String(error?.message ?? error) }),
+      );
+
+      timer = setInterval(() => {
+        tick(state, io, inst).catch((error) => io.log({ kind: "tick-error", error: String(error?.stack ?? error) }));
+      }, options.tick);
+      timer.unref?.();
+    } catch (error) {
+      // Nothing may stay behind when the plugin fails to load: no instance, hook, timer or stream.
+      await cleanup();
+      throw error;
+    }
+
+    return cleanup;
   },
 };

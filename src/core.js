@@ -120,7 +120,7 @@ export function parseSettings(input) {
     if (rawValue === undefined) continue;
     const key = settingKey(rawKey);
     if (!key) {
-      errors.push({ key: undefined, text: `unknown setting "${rawKey}"` });
+      errors.push({ key: undefined, raw: rawKey, text: `unknown setting "${rawKey}"` });
       continue;
     }
     if (key === "loop") {
@@ -137,21 +137,29 @@ export function parseSettings(input) {
   return { patch, errors };
 }
 
+/** Kill limits a rejected entry was (or may have been) about: they must not stay armed by default. */
+function disarmedBy(error) {
+  if (error.key) return KILL_SETTINGS.includes(error.key) ? [error.key] : [];
+  return /kill/i.test(String(error.raw ?? "")) ? KILL_SETTINGS : [];
+}
+
 /**
- * Settings of one command: defaults overlaid with its directive. A rejected kill value disarms that
- * kill instead of inheriting the default.
+ * Settings of one command: defaults overlaid with its directive. Anything unreadable about a kill
+ * limit switches that limit off instead of leaving the default armed.
  */
 export function resolveSettings(defaults, directive) {
   const { patch, errors } = parseSettings(directive?.values);
+  const all = [...(directive?.errors ?? []), ...errors];
   const settings = { ...defaults, ...patch };
-  for (const error of errors) if (KILL_SETTINGS.includes(error.key)) settings[error.key] = 0;
-  const notes = [...(directive?.errors ?? []), ...errors.map((error) => error.text)];
-  return { settings, notes };
+  for (const error of all) for (const key of disarmedBy(error)) settings[key] = 0;
+  return { settings, notes: all.map((error) => error.text) };
 }
 
 const DIRECTIVE = /^\s*#+\s*watchdog\s*:\s*(.*)$/i;
 // Shells where a first line starting with "#" is a comment.
 const DIRECTIVE_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish", "pwsh", "powershell"]);
+// Shells whose commands can carry a kill tag: "exit" as the last line keeps the status of the command.
+const TAG_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish"]);
 
 export function shellName(shell) {
   return String(shell ?? "").split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
@@ -173,17 +181,23 @@ export function parseDirective(command, shell) {
   const match = DIRECTIVE.exec(first);
   if (!match) return none;
   const directive = { found: true, off: false, values: {}, errors: [] };
+  const seen = new Set();
   for (const token of match[1].trim().split(/[\s,]+/).filter(Boolean)) {
     if (/^(off|disabled?|none)$/i.test(token)) {
       directive.off = true;
       continue;
     }
     const eq = token.indexOf("=");
-    if (eq <= 0 || eq === token.length - 1) {
-      directive.errors.push(`could not read "${token}" (expected name=value)`);
+    const name = eq < 0 ? token : token.slice(0, eq);
+    const key = settingKey(name);
+    if (!key && eq <= 0) {
+      directive.errors.push({ key: undefined, raw: token, text: `could not read "${token}" (expected name=value)` });
       continue;
     }
-    directive.values[token.slice(0, eq)] = token.slice(eq + 1).replace(/^["']|["']$/g, "");
+    if (key && seen.has(key)) directive.errors.push({ key, raw: name, text: `${SETTING_LABELS[key]} is given more than once` });
+    if (key) seen.add(key);
+    // A setting named without a value is kept, so that it is rejected under its own name.
+    directive.values[name] = eq < 0 ? "" : token.slice(eq + 1).replace(/^["']|["']$/g, "");
   }
   return directive;
 }
@@ -202,7 +216,7 @@ export function parseOptions(raw) {
   const settings = { ...SETTING_DEFAULTS, ...parsed.patch };
   for (const error of parsed.errors) {
     errors.push(error.text);
-    if (KILL_SETTINGS.includes(error.key)) settings[error.key] = 0;
+    for (const key of disarmedBy(error)) settings[key] = 0;
   }
 
   const options = { ...OPTION_DEFAULTS, ignore: [] };
@@ -244,7 +258,11 @@ export function parseOptions(raw) {
     }
   }
   const known = new Set(Object.keys(OPTION_DEFAULTS));
-  for (const key of Object.keys(rest)) if (!known.has(key)) errors.push(`unknown option "${key}"`);
+  for (const key of Object.keys(rest)) {
+    if (known.has(key)) continue;
+    errors.push(`unknown option "${key}"`);
+    for (const limit of disarmedBy({ raw: key })) settings[limit] = 0;
+  }
   return { options, settings, errors };
 }
 
@@ -517,36 +535,54 @@ export function killReason(rec) {
 
 // Identity of a command that may be killed: a unique comment line written into the command when it is
 // launched. It ends up in the argv of exactly that process, so a reused pid can never pass for it.
+//
+// A shell replaces itself with the last command of its script, and the tag would leave the argv with
+// it. So a tagged command also gets "exit" as its last line: the shell stays, and "exit" without an
+// argument keeps the status of the command before it.
 const TAG_PREFIX = "# shell-watchdog:";
-const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/;
+const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/i;
+const GUARD_LINE = "\nexit";
 
 export const tagLine = (tag) => `${TAG_PREFIX}${tag}`;
 
 export function addTag(command, tag) {
-  return `${tagLine(tag)}\n${command}`;
+  return `${tagLine(tag)}\n${command}${GUARD_LINE}`;
 }
 
-/** Splits the tag line off a command: { tag, command }. tag is null when there is none. */
+/** Splits the tag off a command: { tag, command }. tag is null when there is none. */
 export function splitTag(command) {
   const text = String(command ?? "");
   const match = TAG_LINE.exec(text);
-  return match ? { tag: match[1], command: text.slice(match[0].length) } : { tag: null, command: text };
+  if (!match) return { tag: null, command: text };
+  const rest = text.slice(match[0].length);
+  return { tag: match[1].toLowerCase(), command: rest.endsWith(GUARD_LINE) ? rest.slice(0, -GUARD_LINE.length) : rest };
 }
+
+/** The command without any tag lines it came with: an identity is never taken from input. */
+export function stripTags(command) {
+  let text = String(command ?? "");
+  for (let split = splitTag(text); split.tag; split = splitTag(text)) text = split.command;
+  return text;
+}
+
+// A backslash at the very end would join the "exit" line to the command.
+const endsWithContinuation = (command) => /\\+$/.exec(command)?.[0].length % 2 === 1;
 
 /** Should a command about to be launched get a tag? Only when a kill limit is armed for it. */
 export function wantsTag(command, shell, defaults, platform) {
-  if (platform === "win32" || !DIRECTIVE_SHELLS.has(shellName(shell))) return false;
-  if (splitTag(command).tag) return false;
+  if (platform === "win32" || !TAG_SHELLS.has(shellName(shell))) return false;
+  if (endsWithContinuation(command)) return false;
   const directive = parseDirective(command, shell);
   return !directive.off && killArmed(resolveSettings(defaults, directive).settings);
 }
 
-// The whole tag must be there: ps shows the line break after it as "\012" or as a real newline.
+// The whole tag must be there, followed by the line break as ps shows it: "\012" on macOS, a space
+// in procps, a real newline elsewhere.
 function hasTag(argv, tag) {
   if (typeof argv !== "string" || !tag) return false;
   const line = tagLine(tag);
   const at = argv.indexOf(line);
-  return at >= 0 && !/^[0-9a-f-]/i.test(argv.slice(at + line.length));
+  return at >= 0 && /^(\s|\\012|$)/.test(argv.slice(at + line.length));
 }
 
 /**
@@ -563,16 +599,22 @@ export function verifyLeader(processes, argv, target) {
   return null;
 }
 
+// ps tells elapsed time in whole seconds, so a start time is known to a second either way. A process
+// counts as older than the SIGTERM only when it is older beyond that doubt.
+const START_SLACK = 2000;
+
 /**
  * After SIGTERM: may the group be killed? Only when the leader is gone or still the tagged command, and
  * the group holds a process that existed before the signal (a reused group id has only younger ones).
+ * argv: command line of the leader pid; "" when ps found no such process, null when ps failed.
  * Returns null when it may, else the reason to refuse.
  */
 export function verifySurvivors(processes, argv, entry) {
   if (!Array.isArray(processes)) return "the process list could not be read";
-  const leader = processes.find((proc) => proc.pid === entry.pid);
+  const leader = processes.some((proc) => proc.pid === entry.pid) && argv !== "";
+  if (leader && typeof argv !== "string") return `process ${entry.pid} could not be checked`;
   if (leader && !hasTag(argv, entry.tag)) return `pid ${entry.pid} now belongs to another process`;
-  const survivor = processes.some((proc) => proc.pgid === entry.pid && proc.startedWall <= entry.termWall);
+  const survivor = processes.some((proc) => proc.pgid === entry.pid && proc.startedWall + START_SLACK <= entry.termWall);
   return survivor ? null : `no process of group ${entry.pid} predates the SIGTERM`;
 }
 
@@ -592,21 +634,39 @@ export function parseProcesses(text, wall) {
 // ---------------------------------------------------------------------------------------------
 // Text
 
+// Every limit here is in UTF-8 bytes: that is what a message costs.
 const COMMAND_CAP = 200;
 const TAIL_BYTES = 1500;
 const TAIL_LINE = 200;
+const NOTES_CAP = 300;
+const OMITTED_CAP = 200;
 export const MESSAGE_CAP = 6000;
 const TAG = "[shell-watchdog]";
 
-const cut = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+const bytes = (text) => Buffer.byteLength(text, "utf8");
 
-/** The command without its directive line, on one line. */
+/** Cuts text to at most max UTF-8 bytes, never inside a character. */
+export function cutBytes(text, max) {
+  if (bytes(text) <= max) return text;
+  const room = max - 3; // the ellipsis takes three bytes
+  let out = "";
+  let used = 0;
+  for (const char of text) {
+    const size = bytes(char);
+    if (used + size > room) break;
+    out += char;
+    used += size;
+  }
+  return max >= 3 ? `${out}…` : "";
+}
+
+/** The command without its tag and directive lines, on one line. */
 export function shortCommand(command) {
-  const lines = splitTag(command).command.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lines = stripTags(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (lines.length && DIRECTIVE.test(lines[0])) lines.shift();
   if (!lines.length) return "(empty command)";
   const more = lines.length > 1 ? ` … (+${lines.length - 1} more lines)` : "";
-  return cut(lines[0], COMMAND_CAP - more.length) + more;
+  return cutBytes(lines[0], COMMAND_CAP - bytes(more)) + more;
 }
 
 /** Last lines of the output, bounded in count, line length and total size. */
@@ -620,12 +680,13 @@ export function tailLines(text, maxLines) {
     else runs.push({ line, count: 1 });
   }
   const picked = [];
-  let bytes = 0;
+  let used = 0;
   for (let i = runs.length - 1; i >= 0 && picked.length < maxLines; i--) {
     const { line, count } = runs[i];
-    const shown = count > 1 ? `${cut(line, TAIL_LINE - 12)} (x${count})` : cut(line, TAIL_LINE);
-    bytes += shown.length + 1;
-    if (bytes > TAIL_BYTES) break;
+    const times = count > 1 ? ` (x${count})` : "";
+    const shown = cutBytes(line, TAIL_LINE - bytes(times)) + times;
+    used += bytes(shown) + 1;
+    if (used > TAIL_BYTES) break;
     picked.unshift(shown);
   }
   return picked;
@@ -687,25 +748,47 @@ export function reportBlock(item) {
   } else if (rec.settings.report > 0) {
     lines.push(`Next status in ${formatDuration(rec.settings.report)} (${call(rec.id, { report: "off" })} to stop).`);
   }
-  if (rec.notes.length) lines.push(`Ignored in its watchdog settings: ${rec.notes.join("; ")}.`);
+  if (rec.notes.length) lines.push(`Ignored in its watchdog settings: ${cutBytes(rec.notes.join("; "), NOTES_CAP)}.`);
   return lines.join("\n");
 }
 
-/** Joins blocks and notices into one message, bounded in size. */
+/**
+ * Joins notices and blocks into one message of at most MESSAGE_CAP bytes. What does not fit is named
+ * in one short line: commands by id, notices by count.
+ */
 export function composeMessage(blocks, notices = [], footer = "") {
-  const parts = [...notices];
-  const skipped = [];
-  let size = parts.join("\n\n").length + footer.length;
-  for (const block of blocks) {
-    if (size + block.text.length + 2 > MESSAGE_CAP && parts.length) skipped.push(block.id);
+  const SEP = 2; // parts are joined by an empty line
+  const end = footer ? cutBytes(footer, 500) : "";
+  let room = MESSAGE_CAP - OMITTED_CAP - SEP - (end ? bytes(end) + SEP : 0);
+  const parts = [];
+  let lostNotices = 0;
+  for (const notice of notices) {
+    const size = bytes(notice) + SEP;
+    if (size > room) lostNotices += 1;
     else {
-      parts.push(block.text);
-      size += block.text.length + 2;
+      parts.push(notice);
+      room -= size;
     }
   }
-  if (skipped.length) parts.push(`${TAG} also due, see the watchdog tool: ${skipped.join(", ")}.`);
-  if (footer) parts.push(footer);
-  return parts.join("\n\n");
+  const skipped = [];
+  for (const block of blocks) {
+    const size = bytes(block.text) + SEP;
+    if (size <= room) {
+      parts.push(block.text);
+      room -= size;
+    } else if (!parts.length) {
+      parts.push(cutBytes(block.text, room - SEP));
+      room = 0;
+    } else skipped.push(block.id);
+  }
+  if (skipped.length || lostNotices) {
+    const what = [];
+    if (lostNotices) what.push(`${lostNotices} more notice${lostNotices === 1 ? "" : "s"} about automatic kills`);
+    if (skipped.length) what.push(`also due: ${skipped.join(", ")}`);
+    parts.push(cutBytes(`${TAG} Not shown, see the watchdog tool: ${what.join("; ")}`, OMITTED_CAP));
+  }
+  if (end) parts.push(end);
+  return cutBytes(parts.join("\n\n"), MESSAGE_CAP);
 }
 
 export function budgetFooter(maxWakes, freeIn) {
@@ -747,6 +830,6 @@ export function statusBlock(rec, options = OPTION_DEFAULTS) {
   }
   if (rec.settings.report > 0) facts.push(`next status in ${formatDuration(Math.max(0, rec.settings.report - (rec.clock - rec.lastReport)))}`);
   if (facts.length) lines.push(`  ${facts.join("; ")}`);
-  if (rec.notes.length) lines.push(`  ignored in its settings: ${rec.notes.join("; ")}`);
+  if (rec.notes.length) lines.push(`  ignored in its settings: ${cutBytes(rec.notes.join("; "), NOTES_CAP)}`);
   return lines.join("\n");
 }
