@@ -78,6 +78,9 @@ async function until(check, ms = 8000) {
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** How a started command ended, or "running" if it has not. For messages of failed checks. */
+const ended = (job) => Promise.race([job.exited, pause(200).then(() => "running")]);
+
 function killGroups(...pids) {
   for (const pid of pids) {
     try {
@@ -233,11 +236,12 @@ test("the guard does not depend on the user's shell setup: aliases, functions, P
         const owner = Number(await io.readClaim(job.claim));
         assert.ok(owner === first.pid || owner === replay.pid);
         const [winner, loser] = owner === first.pid ? [first, replay] : [replay, first];
+        assert.equal(io.alive(loser.pid), true, `the other launch runs on without a guard: ${JSON.stringify(await ended(loser))}`);
         await io.requestStop(job.claim);
         await winner.exited;
         assert.ok(await until(async () => (await group(winner.pid)).length === 0), "the group of the claim's owner is stopped");
         await pause(1500);
-        assert.equal(io.alive(loser.pid), true, "the claim was made once, whatever mkdir is said to be");
+        assert.equal(io.alive(loser.pid), true, `the claim was made once, whatever mkdir is said to be: ${JSON.stringify(await ended(loser))}`);
       } finally {
         killGroups(first.pid, replay.pid);
       }
