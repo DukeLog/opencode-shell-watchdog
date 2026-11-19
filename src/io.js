@@ -1,7 +1,7 @@
 // Everything the watchdog does to the outside world: clocks, output files, the claims of guards, the
 // log. It reads the liveness of a pid and never sends a signal.
 
-import { appendFile, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -51,7 +51,8 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
 
     /**
      * Makes this server's own part of the claims directory. Returns its path, or null when it cannot
-     * be used: then no command gets a kill limit.
+     * be used: then no command gets a kill limit. The parts of other servers are never touched:
+     * nothing here can tell whether a server, or a guard of one of its commands, is still alive.
      */
     async prepareClaims(space) {
       const dir = join(claims, space);
@@ -60,25 +61,6 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
         return dir;
       } catch {
         return null;
-      }
-    },
-
-    /** Removes the parts of servers that are long gone: untouched for maxAge, and not `space`. */
-    async sweepClaims(space, maxAge) {
-      let names;
-      try {
-        names = await readdir(claims);
-      } catch {
-        return;
-      }
-      for (const name of names) {
-        if (name === space) continue;
-        try {
-          const info = await stat(join(claims, name));
-          if (Date.now() - info.mtimeMs > maxAge) await rm(join(claims, name), { recursive: true, force: true });
-        } catch {
-          // Gone meanwhile, or not ours to remove.
-        }
       }
     },
 

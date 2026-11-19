@@ -295,18 +295,18 @@ test("claims: a part of the directory for every server; read, stop, take back, d
   await io.dropClaim(claim);
   assert.equal(await io.readClaim(claim), null);
 
-  // The parts of servers that are long gone are removed; this server's own and recent ones stay.
+  // Every server has a part of its own, and none ever removes another's, however old it looks:
+  // a guard of a long-running command may be at work in it.
   const base = join(space, "..");
-  const old = await io.prepareClaims("server-old");
-  const recent = await io.prepareClaims("server-recent");
-  await mkdir(join(old, randomUUID()));
-  const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60_000);
-  await utimes(old, longAgo, longAgo);
-  await utimes(space, longAgo, longAgo);
-  await io.sweepClaims("server-1", 7 * 24 * 60 * 60_000);
-  assert.deepEqual((await readdir(base)).sort(), ["server-1", "server-recent"]);
-  assert.ok(existsSync(recent));
-  await createIO({ claims: join(dir, "no such directory") }).sweepClaims("x", 0);
+  const other = await io.prepareClaims("server-2");
+  const theirs = join(other, randomUUID());
+  await mkdir(theirs);
+  const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60_000);
+  await utimes(other, longAgo, longAgo);
+  assert.equal(await io.prepareClaims("server-1"), space, "making the own part again changes nothing");
+  assert.deepEqual((await readdir(base)).sort(), ["server-1", "server-2"]);
+  assert.ok(existsSync(theirs));
+  assert.equal(typeof io.sweepClaims, "undefined");
 });
 
 test("output files: size, identity and a slice of bytes", async () => {

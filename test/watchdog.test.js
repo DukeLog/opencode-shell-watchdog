@@ -36,6 +36,7 @@ function world() {
     readGate: null,
     stopGate: null,
     cancelGate: null,
+    cancelFails: false,
     getGate: null,
     readFails: false,
     claimFails: false,
@@ -93,6 +94,7 @@ function world() {
         w.cancelGate = null;
         await gate.promise;
       }
+      if (w.cancelFails) throw Object.assign(new Error("cannot remove"), { code: "EIO" });
       if (w.claims.has(claim)) w.claims.get(claim).stop = false;
       w.cancelled.push(claim);
     },
@@ -795,8 +797,10 @@ test("kill: the decision is recorded before the stop is written, and carried out
 test("kill: the stop file ends up saying what the record says, whoever writes last", async () => {
   // The agent switches the limit off while the stop is being written: it is taken back afterwards.
   const off = await atKillLimit();
-  assert.match(await toolCall(off.w.state, off.w.io, off.a, { id: "sh_1", killSilence: "off" }, "ses_1"), /The stop that was asked for is taken back/);
+  const answer = toolCall(off.w.state, off.w.io, off.a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  await settle();
   await off.release();
+  assert.match(await answer, /The stop that was asked for is taken back/);
   assert.equal(off.w.claims.get(FIRST_CLAIM).stop, false, "written, then removed: in that order");
   assert.equal(off.w.state.shells.get("sh_1").killed, null);
   assert.equal(off.a.sent.length, 0, "nothing was done, nothing is said");
@@ -808,9 +812,11 @@ test("kill: the stop file ends up saying what the record says, whoever writes la
   stale.w.advance(10 * MIN);
   const next = tick(stale.w.state, stale.w.io, stale.a);
   await settle();
-  await toolCall(stale.w.state, stale.w.io, stale.a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  const told = toolCall(stale.w.state, stale.w.io, stale.a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  await settle();
   await stale.release();
   await next;
+  await told;
   await settle();
   assert.equal(stale.w.claims.get(FIRST_CLAIM).stop, false, "the late writer leaves no stop behind");
   assert.equal(stale.w.state.shells.get("sh_1").killed, null);
@@ -823,7 +829,8 @@ test("kill: the stop file ends up saying what the record says, whoever writes la
   assert.equal(w.claims.get(FIRST_CLAIM).stop, true);
   w.cancelGate = deferred();
   const gate = w.cancelGate;
-  await toolCall(w.state, w.io, a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  const takingBack = toolCall(w.state, w.io, a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  await settle();
   await toolCall(w.state, w.io, a, { id: "sh_1", killRuntime: "1m" }, "ses_1");
   w.advance(TICK);
   const pass = tick(w.state, w.io, a);
@@ -831,10 +838,33 @@ test("kill: the stop file ends up saying what the record says, whoever writes la
   assert.notEqual(w.state.shells.get("sh_1").killed, null, "the runtime limit has fired");
   gate.resolve();
   await pass;
+  await takingBack;
   await settle();
   assert.deepEqual(w.cancelled, [FIRST_CLAIM]);
   assert.deepEqual(w.stops, [FIRST_CLAIM, FIRST_CLAIM], "written, taken back, written again");
   assert.equal(w.claims.get(FIRST_CLAIM).stop, true, "the late cancellation did not remove the new stop");
+});
+
+test("kill: a stop that cannot be taken back is said to be still there, and taken back as soon as it can be", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  await w.run(a, 2 * MIN);
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, true);
+
+  w.cancelFails = true;
+  const answer = await toolCall(w.state, w.io, a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  assert.match(answer, /could NOT be taken back yet \(EIO\): the command may still be stopped\. The watchdog keeps trying\./);
+  assert.equal(w.state.shells.get("sh_1").killed, null);
+  assert.deepEqual([...w.state.unsettled], [FIRST_CLAIM]);
+  await w.run(a, MIN);
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, true, "still there");
+
+  w.cancelFails = false;
+  await w.run(a, TICK);
+  await settle();
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, false);
+  assert.equal(w.state.unsettled.size, 0);
+  assert.equal(a.sent.filter((message) => /still running/.test(message.text)).length, 0, "a stop that was taken back is not followed up");
 });
 
 test("kill: a command that ends while its stop is being written", async () => {

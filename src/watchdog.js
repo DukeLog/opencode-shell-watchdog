@@ -40,7 +40,7 @@ import {
 
 // Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
 // it does not understand.
-const KEY = Symbol.for("opencode-shell-watchdog/state-7");
+const KEY = Symbol.for("opencode-shell-watchdog/state-8");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -67,6 +67,7 @@ export function createState() {
     issued: new Map(), // tag -> { at, claim }: ids of guards given to commands that are being launched
     obsolete: new Map(), // claim -> obs: claims that are of no use any more and will be removed
     ops: new Map(), // claim -> promise: the last operation on the files of a claim, one at a time
+    unsettled: new Set(), // claims whose stop file could not be made to say what the record says
     notices: new Map(), // sessionID -> [{ text, at, dir, workspace }]: what happened to kill limits
     sessions: new Map(), // sessionID -> { wakes, sentWall, sentObs, missing }
     instances: new Set(),
@@ -309,8 +310,11 @@ function sweep({ state, io }) {
   for (const [claim, at] of state.obsolete) {
     if (state.obs - at < CLAIM_LINGER) continue;
     state.obsolete.delete(claim);
+    state.unsettled.delete(claim);
     void serial(state, claim, () => io.dropClaim(claim)).catch(() => {});
   }
+  // A stop file that could not be written or removed is tried again, until it is as it should be.
+  for (const claim of state.unsettled) void settleStop(state, io, claim).catch(() => {});
   for (const [sessionID, list] of state.notices) {
     const fresh = list.filter((notice) => state.obs - notice.at <= NOTICE_TTL);
     if (fresh.length) state.notices.set(sessionID, fresh);
@@ -480,8 +484,16 @@ function settleStop(state, io, claim) {
   return serial(state, claim, async () => {
     let wanted = false;
     for (const rec of state.shells.values()) if (rec.claim === claim && rec.killed) wanted = true;
-    if (wanted) await io.requestStop(claim);
-    else await io.cancelStop(claim);
+    try {
+      if (wanted) await io.requestStop(claim);
+      else await io.cancelStop(claim);
+    } catch (error) {
+      // A stop that should be gone and is not could still be acted on: remember to try again. (A
+      // stop that could not be written is given up by the caller instead: the limit is switched off.)
+      if (!wanted) state.unsettled.add(claim);
+      throw error;
+    }
+    state.unsettled.delete(claim);
     return wanted;
   });
 }
@@ -719,8 +731,16 @@ export async function toolCall(state, io, inst, input, sessionID) {
   let withdrawn = "";
   if (own.killed && patch[own.killed.setting] === 0) {
     own.killed = null;
-    void settleStop(state, io, own.claim).catch(() => {});
-    withdrawn = "\nThe stop that was asked for is taken back; if the guard of the command has already seen it, the command is being stopped all the same.";
+    try {
+      // Bounded: the answer of the tool must not hang on a file system that does.
+      const settling = settleStop(state, io, own.claim);
+      settling.catch(() => {});
+      await withTimeout(settling, API_TIMEOUT);
+      withdrawn = "\nThe stop that was asked for is taken back; if the guard of the command has already seen it, the command is being stopped all the same.";
+    } catch (error) {
+      withdrawn = `\nThe stop that was asked for could NOT be taken back yet (${errorCode(error)}): the command may still be stopped. The watchdog keeps trying.`;
+      log(state, io, own, { kind: "withdraw-failed", id, error: errorCode(error) });
+    }
   }
   if (snooze !== undefined) {
     own.checkAt = snooze > 0 ? own.clock + snooze : 0;

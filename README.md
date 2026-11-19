@@ -174,7 +174,9 @@ process group.
 
 As long as the guard lives, its group exists and the group's id cannot be given to anything else. So a
 guard can only ever stop the group it was started in, and nothing depends on pids being unique, on
-clocks, or on the order in which events arrive.
+clocks, or on the order in which events arrive. (This is about commands as OpenCode launches them. It
+is not a defence against handing the environment of one launch to another process on purpose — whoever
+can do that can stop the command anyway.)
 
 Nor does the guard depend on your shell setup: every word of its line is quoted, so no alias applies;
 `/bin/sh` is called by its path; inside it the tools (`ps`, `mkdir`, `sleep`) are found on the system's
@@ -205,7 +207,9 @@ What follows from that:
 Needs macOS or Linux, one of `sh`, `bash`, `zsh`, `dash`, `ash` as the shell of the command, and a
 `ps` that understands `-o pgid= -p <pid>` (procps, BSD; not BusyBox). The claims are kept in
 `$XDG_STATE_HOME/opencode-shell-watchdog/claims`, by default under `~/.local/state`, in a directory per
-server process. Processes that left the command's process group (`setsid`, daemons) are not reached.
+server process. A claim is removed a minute after its command is no longer watched; what a server
+leaves behind when it stops is never removed by another one, and can be deleted by hand while OpenCode
+is not running. Processes that left the command's process group (`setsid`, daemons) are not reached.
 
 ## Time
 

@@ -557,8 +557,9 @@ export function killReason(rec) {
 // The second line starts a guard: a small loop in a plain /bin/sh, in the command's own process group.
 // The guard
 //   - takes the path of its claim from the environment. The text of a command can be copied and run
-//     again anywhere; the environment of one launch cannot, and the line removes the variable from
-//     the command's shell at once, so that not even the command's own children inherit it;
+//     again anywhere; the environment of one launch goes nowhere by itself, and the line removes the
+//     variable from the command's shell at once, so that not even the command's own children
+//     inherit it;
 //   - goes on only if it is a member of the process group led by the command's shell;
 //   - claims the id by creating the directory (only the first to try can) and writes the pid of the
 //     command's shell there;
@@ -566,6 +567,8 @@ export function killReason(rec) {
 //     few seconds later, SIGKILL to the process group it is in.
 // As long as the guard lives, that group exists and its id cannot be given to anything else. So a
 // guard can only ever stop the group it was started in, whatever happens to pids, clocks or events.
+// This holds for commands launched through the hook. It is not a defence against somebody who hands
+// the environment of one launch to another process on purpose; that person can stop the command anyway.
 //
 // Nothing in the line depends on the user's shell setup: every word is quoted (no alias applies),
 // /bin/sh is called by its path, and inside it the tools are found on the system's default path,
