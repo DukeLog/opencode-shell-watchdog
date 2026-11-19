@@ -13,17 +13,20 @@ import { addInstance, beforeCreate, handleEvent, removeInstance, sharedState, ti
 
 const EVENTS = ["shell.created", "shell.exited", "shell.deleted", "session.deleted"];
 
-// A tool catalog may show only the first paragraph of a description, so everything the model has to
-// know before it launches a command is in that paragraph.
-const TOOL_DESCRIPTION = `Watchdog for shell commands you leave running: when one prints nothing for a while or keeps repeating the same output, a "[shell-watchdog]" message arrives in this session and you decide whether to wait or stop it (nothing is killed automatically unless a kill limit was set at launch). To set limits for one command at launch, make its first line a comment, e.g. "# watchdog: report=5m silence=off" for a status report every 5 minutes; keys: silence, loop, report, kill-silence, kill-runtime; "# watchdog: off" launches it unwatched. Call this tool with no arguments to list the watched commands of this session, or with "id" and settings to change the limits of a running command.
+// Code Mode shows only the first paragraph of a description, cut at about 500 characters. Everything
+// the model has to know before it launches a command is therefore said there, and briefly.
+const TOOL_DESCRIPTION = `Watchdog for shell commands you leave running: a "[shell-watchdog]" message arrives when one goes silent or repeats its output, and you decide whether to wait or stop it. Set limits at launch with a first-line comment: "# watchdog: report=5m" (status every 5m), "# watchdog: silence=30m", "# watchdog: kill-runtime=2h kill-silence=20m" (auto-kill, launch only), "# watchdog: off". Call with no arguments to list watched commands, or with "id" and settings to change limits.
 
-Settings:
+Every shell command you start is watched. Nothing is killed automatically unless a kill limit was given at launch.
+
+Settings, in the first-line comment (name=value, separated by spaces) or as arguments of this tool:
 - silence: report when nothing happens for this long ("5m", "90s", "1h30m"); "off" stops stall reports
 - loop: what counts as "something happened" - "exact" (a line not printed recently), "shape" (same, ignoring numbers), "off" (any output)
 - report: a status report at this interval whatever the command is doing; "off" to stop
+- kill-silence, kill-runtime: stop the command after this long without output / of runtime; only at launch, and this tool can then change them or switch them off
+Arguments of this tool only:
 - snooze: no reports for this long, then one check
-- off: true - stop watching the command
-- kill-silence, kill-runtime: stop the command after this long without output / of runtime. They can only be given at launch ("# watchdog: kill-runtime=2h"); this tool can change or switch off a limit given that way.`;
+- off: true - stop watching the command`;
 
 const TOOL_INPUT = {
   type: "object",

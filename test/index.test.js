@@ -69,12 +69,15 @@ test("setup registers the hook, the tool and one instance; cleanup takes all of 
   assert.equal(tool.name, "watchdog");
   assert.deepEqual(tool.options, { pinned: true });
   assert.equal(tool.input.additionalProperties, false);
-  // A catalog may show the first paragraph only: the launch syntax has to be in it.
+  // Code Mode shows the first paragraph only, cut at about 500 characters: the launch syntax has to
+  // be in it, whole.
   const [firstParagraph] = tool.description.split("\n\n");
   assert.doesNotMatch(firstParagraph, /\n/);
-  assert.match(firstParagraph, /"# watchdog: report=5m silence=off"/);
-  assert.match(firstParagraph, /kill-silence, kill-runtime/);
-  assert.match(firstParagraph, /"# watchdog: off"/);
+  assert.ok(firstParagraph.length <= 480, `${firstParagraph.length} characters`);
+  for (const example of ['"# watchdog: report=5m"', '"# watchdog: silence=30m"', '"# watchdog: kill-runtime=2h kill-silence=20m"', '"# watchdog: off"']) {
+    assert.ok(firstParagraph.includes(example), example);
+  }
+  assert.match(firstParagraph, /Call with no arguments to list watched commands/);
   const listed = await tool.execute({}, { sessionID: "ses_index" });
   assert.match(listed.content, /No shell command of this session is being watched/);
 
@@ -92,6 +95,9 @@ test("the hook gives every launch of a kill-limited command a tag of its own", a
     const plain = { command: "./job.sh", shell: "/bin/zsh" };
     await run(plain);
     assert.equal(plain.command, "./job.sh", "no kill limit: the command is not touched");
+    const directed = { command: "# watchdog: report=5m\n./job.sh", shell: "/bin/zsh" };
+    await run(directed);
+    assert.equal(directed.command, "# watchdog: report=5m\n./job.sh");
 
     const text = "# watchdog: kill-runtime=2h\n./job.sh";
     const first = { command: text, shell: "/bin/zsh" };
@@ -102,7 +108,7 @@ test("the hook gives every launch of a kill-limited command a tag of its own", a
     assert.match(tags[0].tag, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.notEqual(tags[0].tag, tags[1].tag);
     assert.deepEqual(tags.map((split) => split.command), [text, text]);
-    assert.ok(first.command.endsWith("\nexit"));
+    assert.deepEqual(first.command.split("\n").slice(1), ["trap : EXIT", ...text.split("\n")]);
 
     // The already tagged text launched once more: the old tag is not taken over.
     const again = { command: first.command, shell: "/bin/zsh" };

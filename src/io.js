@@ -20,7 +20,7 @@ export function createIO({ log: logFile = "", ps: psCommand = "ps", psTimeout = 
         psCommand,
         args,
         { env: { ...process.env, LC_ALL: "C" }, timeout: psTimeout, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
-        (error, stdout) => (error ? reject(Object.assign(error, { stdout })) : resolve(stdout)),
+        (error, stdout, stderr) => (error ? reject(Object.assign(error, { stdout, stderr })) : resolve(stdout)),
       );
     });
 
@@ -76,8 +76,10 @@ export function createIO({ log: logFile = "", ps: psCommand = "ps", psTimeout = 
     /** Command line of one process as ps prints it; "" when there is no such process. */
     argv(pid) {
       return ps(["-ww", "-o", "command=", "-p", String(pid)]).catch((error) => {
-        // ps exits with 1 and prints nothing when the pid does not exist. Anything else is a failure.
-        if (error?.code === 1 && !error.killed && String(error.stdout ?? "").trim() === "") return "";
+        // ps exits with 1 and prints nothing at all when the pid does not exist. Anything else,
+        // a complaint on stderr included, is a failure and must not pass for "no such process".
+        const silent = String(error?.stdout ?? "").trim() === "" && String(error?.stderr ?? "").trim() === "";
+        if (error?.code === 1 && !error.killed && silent) return "";
         throw error;
       });
     },

@@ -116,13 +116,17 @@ function parseLoop(value) {
 export function parseSettings(input) {
   const patch = {};
   const errors = [];
+  const seen = new Set();
   for (const [rawKey, rawValue] of Object.entries(input ?? {})) {
     if (rawValue === undefined) continue;
     const key = settingKey(rawKey);
     if (!key) {
-      errors.push({ key: undefined, raw: rawKey, text: `unknown setting "${rawKey}"` });
+      errors.push({ key: undefined, text: `unknown setting "${rawKey}"` });
       continue;
     }
+    // "killRuntime" and "kill-runtime" are one setting: two values for it cannot both be meant.
+    if (seen.has(key)) errors.push({ key, text: `${SETTING_LABELS[key]} is given more than once` });
+    seen.add(key);
     if (key === "loop") {
       const mode = parseLoop(rawValue);
       if (mode) patch.loop = mode;
@@ -137,29 +141,29 @@ export function parseSettings(input) {
   return { patch, errors };
 }
 
-/** Kill limits a rejected entry was (or may have been) about: they must not stay armed by default. */
-function disarmedBy(error) {
-  if (error.key) return KILL_SETTINGS.includes(error.key) ? [error.key] : [];
-  return /kill/i.test(String(error.raw ?? "")) ? KILL_SETTINGS : [];
+/**
+ * Automatic kill needs settings that were understood completely. One unreadable entry of any kind, and
+ * nothing is killed: a typo must never leave a limit armed that the author meant to change.
+ */
+function disarm(settings) {
+  for (const key of KILL_SETTINGS) settings[key] = 0;
 }
 
-/**
- * Settings of one command: defaults overlaid with its directive. Anything unreadable about a kill
- * limit switches that limit off instead of leaving the default armed.
- */
+/** Settings of one command: defaults overlaid with its directive. */
 export function resolveSettings(defaults, directive) {
   const { patch, errors } = parseSettings(directive?.values);
   const all = [...(directive?.errors ?? []), ...errors];
   const settings = { ...defaults, ...patch };
-  for (const error of all) for (const key of disarmedBy(error)) settings[key] = 0;
+  if (all.length) disarm(settings);
   return { settings, notes: all.map((error) => error.text) };
 }
 
 const DIRECTIVE = /^\s*#+\s*watchdog\s*:\s*(.*)$/i;
 // Shells where a first line starting with "#" is a comment.
 const DIRECTIVE_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish", "pwsh", "powershell"]);
-// Shells whose commands can carry a kill tag: "exit" as the last line keeps the status of the command.
-const TAG_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish"]);
+// Shells whose commands can carry a kill tag (see addTag). Not ksh and mksh: with an EXIT trap set
+// they turn a death by signal into an ordinary exit code, mksh even into 0.
+const TAG_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ash", "fish"]);
 
 export function shellName(shell) {
   return String(shell ?? "").split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
@@ -191,11 +195,12 @@ export function parseDirective(command, shell) {
     const name = eq < 0 ? token : token.slice(0, eq);
     const key = settingKey(name);
     if (!key && eq <= 0) {
-      directive.errors.push({ key: undefined, raw: token, text: `could not read "${token}" (expected name=value)` });
+      directive.errors.push({ key: undefined, text: `could not read "${token}" (expected name=value)` });
       continue;
     }
-    if (key && seen.has(key)) directive.errors.push({ key, raw: name, text: `${SETTING_LABELS[key]} is given more than once` });
-    if (key) seen.add(key);
+    // The same spelling twice would silently overwrite itself in `values`.
+    if (seen.has(name)) directive.errors.push({ key, text: `"${name}" is given more than once` });
+    seen.add(name);
     // A setting named without a value is kept, so that it is rejected under its own name.
     directive.values[name] = eq < 0 ? "" : token.slice(eq + 1).replace(/^["']|["']$/g, "");
   }
@@ -214,10 +219,7 @@ export function parseOptions(raw) {
   }
   const parsed = parseSettings(settingInput);
   const settings = { ...SETTING_DEFAULTS, ...parsed.patch };
-  for (const error of parsed.errors) {
-    errors.push(error.text);
-    for (const key of disarmedBy(error)) settings[key] = 0;
-  }
+  for (const error of parsed.errors) errors.push(error.text);
 
   const options = { ...OPTION_DEFAULTS, ignore: [] };
   const duration = (key, min) => {
@@ -258,11 +260,8 @@ export function parseOptions(raw) {
     }
   }
   const known = new Set(Object.keys(OPTION_DEFAULTS));
-  for (const key of Object.keys(rest)) {
-    if (known.has(key)) continue;
-    errors.push(`unknown option "${key}"`);
-    for (const limit of disarmedBy({ raw: key })) settings[limit] = 0;
-  }
+  for (const key of Object.keys(rest)) if (!known.has(key)) errors.push(`unknown option "${key}"`);
+  if (errors.length) disarm(settings);
   return { options, settings, errors };
 }
 
@@ -368,8 +367,10 @@ export function createRecord(raw, settings, notes = []) {
     rev: 0,
     clock: 0,
 
-    // Observation of the output file.
+    // Observation of the output file. fresh: the last pass really looked at the output and took what
+    // it saw; without that, nothing may be concluded about silence.
     observe: "ok",
+    fresh: false,
     okSince: 0,
     ino: null,
     size: 0,
@@ -435,6 +436,7 @@ export function thresholdOf(rec, options = OPTION_DEFAULTS) {
  * sample: { grew, lines, sampled } — bytes arrived, complete new lines, part of the output was skipped.
  */
 export function absorb(rec, sample) {
+  rec.fresh = true;
   const before = progressAt(rec);
   if (sample.grew) rec.lastGrowth = rec.clock;
   if (sample.sampled) rec.sampled = true;
@@ -481,12 +483,14 @@ export function decide(rec, options = OPTION_DEFAULTS) {
   const view = assess(rec, options);
   const decision = { stall: false, forced: false, periodic: false, view };
   if (rec.killed) return decision;
+  // A stall is reported only from what this pass saw, never from an older picture.
+  const stalled = rec.fresh && isStalled(view.state);
   if (rec.checkAt) {
     if (rec.clock < rec.checkAt) return decision;
     // The snooze is over: the check the agent asked for, whatever the budgets say.
-    if (isStalled(view.state)) decision.stall = decision.forced = true;
+    if (stalled) decision.stall = decision.forced = true;
   }
-  if (!decision.stall && isStalled(view.state) && !rec.episode.muted) {
+  if (!decision.stall && stalled && !rec.episode.muted) {
     decision.stall = rec.episode.reports === 0 || rec.clock - rec.episode.lastAt >= stallWait(rec, options);
   }
   decision.periodic = rec.settings.report > 0 && rec.clock - rec.lastReport >= rec.settings.report;
@@ -519,7 +523,7 @@ export function applySettings(rec, patch) {
 
 export const killArmed = (settings) => settings.killSilence > 0 || settings.killRuntime > 0;
 
-/** Why the command must be killed now, or null. Silence needs a readable output file. */
+/** Why the command must be killed now, or null. Silence needs the output as this pass saw it. */
 export function killReason(rec) {
   if (rec.killed || !rec.tag) return null;
   const { killRuntime, killSilence } = rec.settings;
@@ -527,7 +531,7 @@ export function killReason(rec) {
     return { setting: "killRuntime", text: `ran for ${formatDuration(rec.clock)}, limit kill-runtime=${formatSetting(killRuntime)}` };
   }
   const quietFor = rec.clock - Math.max(rec.lastGrowth, rec.okSince);
-  if (killSilence > 0 && rec.observe === "ok" && quietFor >= killSilence) {
+  if (killSilence > 0 && rec.fresh && rec.observe === "ok" && quietFor >= killSilence) {
     return { setting: "killSilence", text: `no output for ${formatDuration(quietFor)}, limit kill-silence=${formatSetting(killSilence)}` };
   }
   return null;
@@ -537,25 +541,26 @@ export function killReason(rec) {
 // launched. It ends up in the argv of exactly that process, so a reused pid can never pass for it.
 //
 // A shell replaces itself with the last command of its script, and the tag would leave the argv with
-// it. So a tagged command also gets "exit" as its last line: the shell stays, and "exit" without an
-// argument keeps the status of the command before it.
+// it. No shell does that while an EXIT trap is set, so a tagged command gets one as its second line.
+// It runs before anything of the command, does nothing, leaves the exit status alone, and the command
+// is free to set a trap of its own.
 const TAG_PREFIX = "# shell-watchdog:";
 const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/i;
-const GUARD_LINE = "\nexit";
+const GUARD_LINE = "trap : EXIT\n";
 
 export const tagLine = (tag) => `${TAG_PREFIX}${tag}`;
 
 export function addTag(command, tag) {
-  return `${tagLine(tag)}\n${command}${GUARD_LINE}`;
+  return `${tagLine(tag)}\n${GUARD_LINE}${command}`;
 }
 
-/** Splits the tag off a command: { tag, command }. tag is null when there is none. */
+/** Splits the tag lines off a command: { tag, command }. tag is null when there is none. */
 export function splitTag(command) {
   const text = String(command ?? "");
   const match = TAG_LINE.exec(text);
   if (!match) return { tag: null, command: text };
   const rest = text.slice(match[0].length);
-  return { tag: match[1].toLowerCase(), command: rest.endsWith(GUARD_LINE) ? rest.slice(0, -GUARD_LINE.length) : rest };
+  return { tag: match[1].toLowerCase(), command: rest.startsWith(GUARD_LINE) ? rest.slice(GUARD_LINE.length) : rest };
 }
 
 /** The command without any tag lines it came with: an identity is never taken from input. */
@@ -565,24 +570,23 @@ export function stripTags(command) {
   return text;
 }
 
-// A backslash at the very end would join the "exit" line to the command.
-const endsWithContinuation = (command) => /\\+$/.exec(command)?.[0].length % 2 === 1;
-
 /** Should a command about to be launched get a tag? Only when a kill limit is armed for it. */
 export function wantsTag(command, shell, defaults, platform) {
   if (platform === "win32" || !TAG_SHELLS.has(shellName(shell))) return false;
-  if (endsWithContinuation(command)) return false;
   const directive = parseDirective(command, shell);
   return !directive.off && killArmed(resolveSettings(defaults, directive).settings);
 }
 
-// The whole tag must be there, followed by the line break as ps shows it: "\012" on macOS, a space
-// in procps, a real newline elsewhere.
+// The tag counts only as the first line of the script the shell was started with (`<shell> … -c
+// <script>`), whole, and followed by the line break as ps shows it: "\012" on macOS, a space in
+// procps, a real newline elsewhere. The same text further down in a command proves nothing.
 function hasTag(argv, tag) {
   if (typeof argv !== "string" || !tag) return false;
+  const flag = /\s-[A-Za-z]*c\s/.exec(argv);
+  if (!flag) return false;
+  const script = argv.slice(flag.index + flag[0].length);
   const line = tagLine(tag);
-  const at = argv.indexOf(line);
-  return at >= 0 && /^(\s|\\012|$)/.test(argv.slice(at + line.length));
+  return script.startsWith(line) && /^(\s|\\012|$)/.test(script.slice(line.length));
 }
 
 /**

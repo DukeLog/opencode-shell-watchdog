@@ -40,7 +40,7 @@ import {
 
 // Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
 // it does not understand.
-const KEY = Symbol.for("opencode-shell-watchdog/state-2");
+const KEY = Symbol.for("opencode-shell-watchdog/state-3");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -64,7 +64,7 @@ export function createState() {
     issued: new Map(), // tag -> obs: tags this plugin wrote into commands that are being launched
     terminating: new Map(), // id -> permission to send SIGKILL after SIGTERM
     notices: new Map(), // sessionID -> [{ text, at, dir, workspace }]: results of automatic kills
-    sessions: new Map(), // sessionID -> { wakes, sentWall, missing }
+    sessions: new Map(), // sessionID -> { wakes, sentWall, sentObs, missing }
     instances: new Set(),
     obs: 0, // observed milliseconds, gaps excluded
     lastTick: null,
@@ -126,7 +126,10 @@ function log(state, io, target, entry) {
  */
 export function beforeCreate(state, io, inst, event, newTag) {
   if (inst.disposed || typeof event?.command !== "string") return;
+  // A tag in the input goes whatever happens next: left in place, it would put the identity of an
+  // earlier command into the argv of this one.
   const command = stripTags(event.command);
+  if (command !== event.command) event.command = command;
   if (!wantsTag(command, event.shell, inst.settings, io.platform)) return;
   const tag = String(newTag()).toLowerCase();
   state.issued.set(tag, state.obs);
@@ -185,7 +188,7 @@ function activate(state, io, inst, raw) {
   const { settings, notes } = resolveSettings(inst.settings, directive);
   if (killArmed(settings) && !raw.tag) {
     for (const key of KILL_SETTINGS) settings[key] = 0;
-    notes.push("kill limits (automatic kill needs macOS or Linux, one of sh, bash, zsh, dash, ksh, fish, and a command that does not end with a backslash)");
+    notes.push("kill limits (automatic kill needs macOS or Linux and one of sh, bash, zsh, dash, ash, fish)");
   }
   state.shells.set(raw.id, createRecord(raw, settings, notes));
   (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
@@ -268,7 +271,9 @@ function sweep({ state, io }) {
   for (const rec of state.shells.values()) watched.add(rec.sessionID);
   for (const [sessionID, book] of state.sessions) {
     book.wakes = book.wakes.filter((at) => state.obs - at < DAY);
-    if (!book.wakes.length && !watched.has(sessionID) && !state.notices.has(sessionID)) state.sessions.delete(sessionID);
+    // What was sent last is remembered for a day: with resume off it decides whether more may follow.
+    const recent = book.sentObs !== null && state.obs - book.sentObs < DAY;
+    if (!book.wakes.length && !recent && !watched.has(sessionID) && !state.notices.has(sessionID)) state.sessions.delete(sessionID);
   }
 }
 
@@ -298,6 +303,8 @@ export function takeLines(buffer, skipFirst) {
 async function observe({ state, io, held, delta, gap }) {
   for (const rec of [...state.shells.values()]) {
     if (state.shells.get(rec.id) !== rec) continue;
+    // Until this pass has looked at the output, nothing is known about the command right now.
+    rec.fresh = false;
     if (!ownerOf(state, rec)) {
       taint(rec);
       continue;
@@ -369,7 +376,7 @@ async function readProcesses(io, pid) {
   };
 }
 
-function disarm(state, rec) {
+function disarm(rec) {
   for (const key of KILL_SETTINGS) rec.settings[key] = 0;
   rec.rev += 1;
 }
@@ -394,7 +401,7 @@ async function enforce({ state, io, held }) {
       }
     }
     if (refusal) {
-      disarm(state, rec);
+      disarm(rec);
       notify(state, rec, killRefusedNotice(rec, reason, refusal));
       log(state, io, rec, { kind: "kill-refused", id: rec.id, pid: rec.pid, why: refusal });
       continue;
@@ -463,7 +470,7 @@ function isNotFound(error) {
 
 function bookOf(state, sessionID) {
   let book = state.sessions.get(sessionID);
-  if (!book) state.sessions.set(sessionID, (book = { wakes: [], sentWall: 0, missing: 0 }));
+  if (!book) state.sessions.set(sessionID, (book = { wakes: [], sentWall: 0, sentObs: null, missing: 0 }));
   return book;
 }
 
@@ -539,6 +546,7 @@ async function deliverSession({ state, io: tickIO, held }, sessionID, { owner, i
   }
   state.notices.delete(sessionID);
   book.sentWall = io.wall();
+  book.sentObs = state.obs;
   const text = composeMessage(blocks, notices.map((notice) => notice.text), footer);
 
   // Whatever happens to this call, it was the attempt: counters already moved, so a failing API is

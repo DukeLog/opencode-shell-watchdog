@@ -146,33 +146,40 @@ seconds later — with the default `tick`, about half a minute — it sends `SIG
 what was done and why.
 
 Before signalling, the watchdog has to be sure that the process id still belongs to the command and was
-not reused by something else. So a command launched with a kill limit is started with two extra lines:
+not reused by something else. So a command launched with a kill limit is started with two extra lines in
+front of it:
 
 ```sh
-# shell-watchdog:3f6c1a52-…      <- first line: a random id, new for every launch
+# shell-watchdog:3f6c1a52-…      <- a random id, new for every launch
+trap : EXIT                      <- keeps the shell from replacing itself with the last command
 # watchdog: kill-silence=30m
 ./flaky-download.sh
-exit                             <- last line
 ```
 
 The id ends up in the arguments of exactly the process started for the command, and a signal is sent
-only while `ps` still shows it there. The last line is needed because a shell replaces itself with the
-last command of its script, and the id would disappear with it; `exit` without an argument passes on the
-status of the command before it, so the exit code does not change. If the id cannot be verified,
-nothing is signalled and the session is told so.
+only while `ps` still shows it there, as the first line of the script. The second line is needed because
+a shell replaces itself with the last command of its script, and the id would disappear with it; no
+shell does that while an EXIT trap is set. The trap does nothing and leaves the exit status alone, and
+the command may set an EXIT trap of its own. If the id cannot be verified, nothing is signalled and the
+session is told so.
 
 What follows from that:
 
 - A kill limit cannot be added to a command that was launched without one. A limit given at launch can
   be changed or switched off while the command runs (`watchdog({id, killSilence: "off"})`).
-- Commands without a kill limit are started exactly as they were written.
-- A command that replaces its shell itself (`exec ./server`) loses the id and is not killed.
-- Anything unreadable in a kill setting (`kill-runtime=`, a typo, the same key twice) switches that limit
-  off rather than leaving a default limit armed.
+- Commands without a kill limit are started exactly as they were written. (A `# shell-watchdog:` line
+  that comes with a command, say copied from `ps`, is removed: an id is never taken from input.)
+- The two lines are visible wherever OpenCode shows the command.
+- A command that replaces its shell itself (`exec ./server`), or removes the trap and ends with an
+  external command, loses the id and is not killed.
+- Automatic kill needs settings that were understood completely. A typo, a missing value or the same
+  key twice in the directive (or in the plugin options) switches automatic kill off for that command,
+  and the first report says what was ignored.
 
-Needs macOS or Linux, a `ps` that understands `-o pid=,pgid=,etime=` and `-o command= -p` (procps, BSD),
-and one of `sh`, `bash`, `zsh`, `dash`, `ash`, `ksh`, `mksh`, `fish`. Processes that left the command's
-process group (`setsid`, daemons) are not reached.
+Needs macOS or Linux, a `ps` that understands `-o pid=,pgid=,etime=` and `-o command= -p` (procps, BSD;
+not BusyBox), and one of `sh`, `bash`, `zsh`, `dash`, `ash`, `fish`. Not `ksh` and `mksh`: with an EXIT
+trap set they report a command killed by a signal as an ordinary exit, `mksh` even as success. Processes
+that left the command's process group (`setsid`, daemons) are not reached.
 
 ## Time
 

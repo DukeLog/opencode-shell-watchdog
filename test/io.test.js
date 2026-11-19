@@ -13,7 +13,8 @@ import { addTag, verifyLeader, verifySurvivors } from "../src/core.js";
 import { createIO } from "../src/io.js";
 
 const posix = process.platform !== "win32";
-const SHELLS = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh", "/usr/bin/fish", "/opt/homebrew/bin/fish"].filter((path) => existsSync(path));
+// Every shell a command can be tagged in, as far as it is installed here.
+const SHELLS = ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/bin/dash", "/bin/ash", "/usr/bin/fish", "/opt/homebrew/bin/fish"].filter((path) => existsSync(path));
 
 /** Starts a command the way OpenCode does: `<shell> -c <command>`, as the leader of its own group. */
 function start(shell, command) {
@@ -37,7 +38,7 @@ test("a tagged command is recognised by its pid in every shell, although its las
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
       const tag = randomUUID();
-      // Without the tag's last line the shell would replace itself with `sleep` and lose the tag.
+      // Without the tag's trap line most shells would replace themselves with `sleep` and lose the tag.
       const job = start(shell, addTag("sleep 30", tag));
       try {
         let argv = "";
@@ -51,6 +52,7 @@ test("a tagged command is recognised by its pid in every shell, although its las
       } finally {
         io.signalGroup(job.pid, "SIGTERM");
       }
+      // The trap line must not turn a death by signal into something that looks like an exit.
       const end = await job.exited;
       assert.ok(end.signal === "SIGTERM" || end.code === 143, JSON.stringify(end));
       assert.ok(await until(() => !io.groupAlive(job.pid)), "the whole group is gone");
@@ -60,14 +62,40 @@ test("a tagged command is recognised by its pid in every shell, although its las
   }
 });
 
-test("the tag's last line keeps the exit status of the command", { skip: !posix }, async (t) => {
+/** Runs a command to its end: { code, signal, stdout }. */
+function run(shell, command) {
+  return new Promise((resolve) => {
+    const child = spawn(shell, ["-c", command], { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.on("close", (code, signal) => resolve({ code, signal, stdout }));
+  });
+}
+
+test("a tagged command behaves like the same command without the tag", { skip: !posix }, async (t) => {
+  const posixScripts = [
+    "true",
+    "(exit 7)",
+    "exit 3",
+    "echo out; false",
+    "# watchdog: kill-runtime=1h\necho directive; exit 4",
+    "f() { return 5; }; f",
+    // The lines that an "exit" appended to the command would have broken:
+    "exit() { return 0; }; false", // a function of that name
+    "cat <<EOF\nhello", // a heredoc that runs to the end of the script
+    "echo one \\", // a line continuation at the end
+    // A command with an EXIT trap of its own replaces the one of the tag.
+    "trap 'echo bye' EXIT\necho hi\n(exit 6)",
+    "trap - EXIT\necho untrapped",
+    "echo \"$#:$0\" | wc -c",
+  ];
+  const fishScripts = ["true", "false", "exit 3", "echo out; false", "# watchdog: kill-runtime=1h\necho directive; exit 4"];
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
-      const failing = shell.endsWith("fish") ? "false" : "(exit 7)";
-      const expected = shell.endsWith("fish") ? 1 : 7;
-      assert.equal((await start(shell, addTag(failing, randomUUID())).exited).code, expected);
-      assert.equal((await start(shell, addTag("true", randomUUID())).exited).code, 0);
-      assert.equal((await start(shell, addTag("# watchdog: kill-runtime=1h\nexit 3", randomUUID())).exited).code, 3);
+      for (const script of shell.endsWith("fish") ? fishScripts : posixScripts) {
+        const [plain, tagged] = await Promise.all([run(shell, script), run(shell, addTag(script, randomUUID()))]);
+        assert.deepEqual(tagged, plain, script);
+      }
     });
   }
 });
@@ -124,6 +152,20 @@ test("a ps that hangs or fails is an error, never an empty answer", { skip: !pos
     await writeFile(broken, "#!/bin/sh\necho 'ps: something is wrong' >&2\nexit 2\n");
     await chmod(broken, 0o755);
     await assert.rejects(createIO({ ps: broken }).argv(process.pid));
+
+    // Exit code 1 means "no such process" only when ps had nothing else to say.
+    const complaining = join(dir, "complaining-ps");
+    await writeFile(complaining, "#!/bin/sh\necho 'ps: cannot read the process table' >&2\nexit 1\n");
+    await chmod(complaining, 0o755);
+    await assert.rejects(createIO({ ps: complaining }).argv(process.pid));
+    const partial = join(dir, "partial-ps");
+    await writeFile(partial, "#!/bin/sh\necho 'half an answer'\nexit 1\n");
+    await chmod(partial, 0o755);
+    await assert.rejects(createIO({ ps: partial }).argv(process.pid));
+    const silent = join(dir, "silent-ps");
+    await writeFile(silent, "#!/bin/sh\nexit 1\n");
+    await chmod(silent, 0o755);
+    assert.equal(await createIO({ ps: silent }).argv(process.pid), "");
     await assert.rejects(createIO({ ps: join(dir, "missing-ps") }).argv(process.pid));
     await assert.rejects(createIO({ ps: join(dir, "missing-ps") }).processes());
   } finally {

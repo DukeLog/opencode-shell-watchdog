@@ -417,6 +417,38 @@ test("an observation is dropped when the settings changed while the output was b
   assert.equal(rec.offset, 4);
 });
 
+test("output that arrived but could not be taken in is not silence: no kill, no report from the old picture", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: "# watchdog: kill-silence=2m silence=1m\n./job.sh" });
+  const rec = w.state.shells.get("sh_1");
+  await w.run(a, 1.5 * MIN);
+  assert.equal(a.sent.length, 1, "the stall was reported once");
+  assert.deepEqual(w.signals, []);
+
+  // New bytes arrive right before the pass that would reach the kill limit, and while they are being
+  // read the agent changes an unrelated setting.
+  w.print("sh_1", "still alive\n");
+  w.readGate = deferred();
+  const gate = w.readGate;
+  w.mono += TICK;
+  w.wall += TICK;
+  const running = tick(w.state, w.io, a);
+  await settle();
+  await toolCall(w.state, w.io, a, { id: "sh_1", report: "30m" }, "ses_1");
+  gate.resolve();
+  await running;
+  assert.equal(rec.fresh, false);
+  assert.deepEqual(w.signals, [], "the two minutes of silence were over before this pass, and it must not act on them");
+  assert.equal(a.sent.length, 1);
+
+  await w.run(a, TICK);
+  assert.equal(rec.offset, 12, "the bytes are taken in by the next pass");
+  await w.run(a, MIN);
+  assert.deepEqual(w.signals, []);
+  await w.run(a, MIN);
+  assert.deepEqual(w.signals, [[100, "SIGTERM"]], "two minutes after the output, not before");
+});
+
 test("reading output: partial lines wait, a replaced file is read again, a flood is sampled", async () => {
   const { w, a } = await started();
   const file = w.shell("sh_1", { pid: 100 });
@@ -497,6 +529,27 @@ test("resume=false: one message waits in the inbox, nothing more until the sessi
   assert.equal(a.sent.length, 2);
 });
 
+test("resume=false: a notice about a finished command waits as well", async () => {
+  const { w, a } = await started({ resume: false });
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  w.processes.push({ pid: 101, pgid: 100, startedWall: w.wall });
+  await w.run(a, 2 * MIN);
+  assert.equal(a.sent.length, 1, "the command was stopped and the session told");
+  w.exit("sh_1", 100);
+  await w.run(a, 10 * MIN);
+  assert.deepEqual(w.signals, [[100, "SIGTERM"], [100, "SIGKILL"]]);
+  assert.equal(a.sent.length, 1, "the second notice is held back: the first message is still unread");
+  const session = w.sessions.get("ses_1");
+  session.time = { busy: w.wall, idle: w.wall + 1 };
+  await w.run(a, TICK);
+  assert.equal(a.sent.length, 2);
+  assert.match(a.sent[1].text, /SIGKILL was sent/);
+
+  // Nothing is kept for ever: a day later the session is forgotten.
+  await w.run(a, 25 * 60 * MIN);
+  assert.equal(w.state.sessions.size, 0);
+});
+
 test("a failed send is an attempt, not something to retry every tick", async () => {
   const { w, a } = await started();
   w.shell("sh_1", { pid: 100 });
@@ -544,7 +597,7 @@ test("kill: a command launched with a limit is tagged, stopped at the limit, and
   w.processes.push({ pid: 101, pgid: 100, startedWall: w.wall });
   const rec = w.state.shells.get("sh_1");
   assert.equal(rec.tag, FIRST_TAG);
-  assert.equal(w.argv.get(100), `/bin/zsh +o nomatch -c # shell-watchdog:${FIRST_TAG}\\012# watchdog: kill-silence=2m silence=off\\012./job.sh\\012exit`);
+  assert.equal(w.argv.get(100), `/bin/zsh +o nomatch -c # shell-watchdog:${FIRST_TAG}\\012trap : EXIT\\012# watchdog: kill-silence=2m silence=off\\012./job.sh`);
   assert.equal(rec.command, KILL_COMMAND, "the record keeps the command as it was given");
   assert.equal(rec.settings.killSilence, 2 * MIN);
 
@@ -651,6 +704,49 @@ test("commands without a kill limit are started exactly as they were given", asy
     assert.equal(event.command, command);
   }
   assert.equal(w.state.issued.size, 0);
+});
+
+test("a tag that comes with a command is removed even when the command gets none of its own", async () => {
+  const { w, a } = await started();
+  const unlimited = "# watchdog: kill-silence=off silence=off\n./job.sh";
+  const event = { command: addTag(unlimited, FIRST_TAG), shell: "/bin/zsh" };
+  beforeCreate(w.state, w.io, a, event, w.newTag);
+  assert.equal(event.command, unlimited);
+  assert.equal(w.state.issued.size, 0);
+});
+
+test("a relaunch of the old tagged text on a reused pid is never taken for the old command", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  const launched = addTag(KILL_COMMAND, FIRST_TAG); // what `ps` and the list of commands show
+  assert.ok(w.argv.get(100).includes(FIRST_TAG));
+
+  // sh_1 ends, its exit event is lost, pid 100 goes to a new command: the same text, copied with its
+  // tag, with the limits switched off this time.
+  const copied = launched.replace("kill-silence=2m", "kill-silence=off");
+  w.shell("sh_2", { pid: 100, command: copied });
+  assert.doesNotMatch(w.argv.get(100), /shell-watchdog/, "the old identity did not get into the new argv");
+  assert.equal(w.state.shells.get("sh_2").tag, null);
+
+  await w.run(a, 3 * MIN);
+  assert.deepEqual(w.signals, [], "the old record cannot signal the new process");
+  assert.match(a.sent[0].text, /sh_1 reached its kill limit .* but was NOT killed: process 100 is not the command that was launched/);
+});
+
+test("a tag further down in a command, or after a -c of its own, proves nothing", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  for (const argv of [
+    `/bin/zsh +o nomatch -c echo hi\\012# shell-watchdog:${FIRST_TAG}\\012sleep 600`,
+    `/bin/zsh +o nomatch -c sh -c # shell-watchdog:${FIRST_TAG}\\012sleep 600`,
+    `/usr/bin/tail -f # shell-watchdog:${FIRST_TAG}`,
+  ]) {
+    w.argv.set(100, argv);
+    const rec = w.state.shells.get("sh_1");
+    rec.settings.killSilence = 2 * MIN; // armed again after each refusal
+    await w.run(a, 3 * MIN);
+    assert.deepEqual(w.signals, [], argv);
+  }
 });
 
 test("tags that never became a command do not pile up", async () => {
