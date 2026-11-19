@@ -166,11 +166,12 @@ process group.
    variable from the command's shell at once, so the command and its children never see it.
 2. The guard goes on only if it is a member of the process group led by the command's shell. (Not so
    under job control, or when the shell leads no group: then there is no guard and no limit.)
-3. It makes the claim by creating a directory, which only the first to try can do.
+3. It makes the claim by creating a file, which only the first to try can do. The shell creates it
+   itself, with no-clobber on; no tool is involved (`mkdir`, for one, is not atomic everywhere).
 4. The watchdog checks that the claim was made for the shell of this very command. Only then is the
    limit in force.
-5. When the limit is reached, the watchdog creates one file in that directory. The guard sees it, and
-   sends `SIGTERM` and then `SIGKILL` to the process group it is in.
+5. When the limit is reached, the watchdog creates a second file next to the claim. The guard sees
+   it, and sends `SIGTERM` and then `SIGKILL` to the process group it is in.
 
 As long as the guard lives, its group exists and the group's id cannot be given to anything else. So a
 guard can only ever stop the group it was started in, and nothing depends on pids being unique, on
@@ -179,7 +180,7 @@ is not a defence against handing the environment of one launch to another proces
 can do that can stop the command anyway.)
 
 Nor does the guard depend on your shell setup: every word of its line is quoted, so no alias applies;
-`/bin/sh` is called by its path; inside it the tools (`ps`, `mkdir`, `sleep`) are found on the system's
+`/bin/sh` is called by its path; inside it the tools (`ps`, `tr`, `sleep`) are found on the system's
 default path, past any function of the same name.
 
 The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
