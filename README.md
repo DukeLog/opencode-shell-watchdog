@@ -141,9 +141,9 @@ Off by default. A kill limit is given when the command is launched (or as a defa
 
 `kill-silence` counts time without a single byte of output (the repetition detector is never used for
 killing); `kill-runtime` counts total runtime. When a limit is reached the watchdog sends `SIGTERM` to
-the command's process group. If the group is still alive at the next check that comes at least five
-seconds later — with the default `tick`, about half a minute — it sends `SIGKILL`. The session is told
-what was done and why.
+the command's process group. If processes of that group are still alive at the next check that comes at
+least five seconds later — with the default `tick`, about half a minute — it sends `SIGKILL`. The
+session is told what was done and why.
 
 Before signalling, the watchdog has to be sure that the process id still belongs to the command and was
 not reused by something else. So a command launched with a kill limit is started with two extra lines in
@@ -156,12 +156,17 @@ trap : EXIT                      <- keeps the shell from replacing itself with t
 ./flaky-download.sh
 ```
 
-The id ends up in the arguments of exactly the process started for the command, and a signal is sent
-only while `ps` still shows it there, as the first line of the script. The second line is needed because
-a shell replaces itself with the last command of its script, and the id would disappear with it; no
-shell does that while an EXIT trap is set. The trap does nothing and leaves the exit status alone, and
-the command may set an EXIT trap of its own. If the id cannot be verified, nothing is signalled and the
-session is told so.
+The id ends up in the arguments of the process started for the command. The first time the watchdog
+sees a process with that pid carrying the id as the first line of its script, started at the moment the
+command was started, it notes the start time `ps` reports for it. From then on the kill limit belongs to
+that one process: a signal is sent only to a pid that has the same start time, still carries the id and
+still leads its own process group, all read in a single `ps` call right before the signal. `SIGKILL`
+goes only to a group that still holds a process that was in it when the `SIGTERM` went out. If any of
+this cannot be verified, nothing is signalled and the session is told so.
+
+The second line is needed because a shell replaces itself with the last command of its script, and the
+id would disappear with it; no shell does that while an EXIT trap is set. The trap does nothing and
+leaves the exit status alone, and the command may set an EXIT trap of its own.
 
 What follows from that:
 
@@ -172,6 +177,11 @@ What follows from that:
 - The two lines are visible wherever OpenCode shows the command.
 - A command that replaces its shell itself (`exec ./server`), or removes the trap and ends with an
   external command, loses the id and is not killed.
+- The limit is dropped, and the session told, when the process cannot be tied to the command: the
+  command was registered more than a minute after its launch, `ps` cannot be read, or the system clock
+  was set back while the command was running.
+- Two things are assumed: a pid is not given to another process within two seconds of the start of the
+  process that had it, nor in the instant between the last check and the signal.
 - Automatic kill needs settings that were understood completely. A typo, a missing value or the same
   key twice in the directive (or in the plugin options) switches automatic kill off for that command,
   and the first report says what was ignored.

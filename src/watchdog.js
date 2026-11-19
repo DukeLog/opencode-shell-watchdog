@@ -11,6 +11,7 @@ import {
   addTag,
   applySettings,
   budgetFooter,
+  captureBirth,
   commit,
   composeMessage,
   createRecord,
@@ -19,8 +20,10 @@ import {
   expireSnooze,
   killArmed,
   killNotice,
+  killOffNotice,
   killReason,
   killRefusedNotice,
+  membersOf,
   parseDirective,
   parseDuration,
   parseSettings,
@@ -40,7 +43,7 @@ import {
 
 // Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
 // it does not understand.
-const KEY = Symbol.for("opencode-shell-watchdog/state-4");
+const KEY = Symbol.for("opencode-shell-watchdog/state-5");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -52,6 +55,8 @@ const PENDING_TTL = 60 * 60_000;
 const PENDING_CAP = 500;
 const NOTICE_TTL = 60 * 60_000;
 const TERMINATING_TTL = 10 * 60_000;
+const IDENTITY_TRIES = 3;
+const CLOCK_STEP = 2_000;
 const STALE_EVENT = 5 * 60_000;
 const PID_MEMORY = 2 * STALE_EVENT;
 const PID_CAP = 5000;
@@ -72,6 +77,7 @@ export function createState() {
     instances: new Set(),
     obs: 0, // observed milliseconds, gaps excluded
     lastTick: null,
+    lastWall: null,
     lock: null,
   };
 }
@@ -169,7 +175,12 @@ function onCreated(state, io, info, location) {
   release(state, io, info.pid, started);
   state.pids.delete(info.pid);
   state.pids.set(info.pid, { started, seen: io.wall() });
-  if (state.pids.size > PID_CAP) state.pids.delete(state.pids.keys().next().value);
+  if (state.pids.size > PID_CAP) {
+    // With a start forgotten early, an older event of that pid could pass for the latest one. Tags
+    // that are still waiting for their event are withdrawn rather than risk that.
+    state.pids.delete(state.pids.keys().next().value);
+    state.issued.clear();
+  }
 
   // Not watched: no session to report to, already over, or an event about a start long ago (a replay,
   // or one held up by a sleeping machine). The id is remembered all the same.
@@ -185,7 +196,13 @@ function onCreated(state, io, info, location) {
   const split = splitTag(info.command);
   const issuedAt = split.tag === null ? undefined : state.issued.get(split.tag);
   if (issuedAt !== undefined) state.issued.delete(split.tag);
-  const tag = issuedAt !== undefined && io.wall() - issuedAt <= ISSUED_TTL && Number.isFinite(started) ? split.tag : null;
+  const age = io.wall() - issuedAt;
+  let untagged = null;
+  if (split.tag === null) untagged = "automatic kill needs macOS or Linux and one of sh, bash, zsh, dash, ash, fish";
+  else if (issuedAt === undefined) untagged = "the id in the command was not issued for this launch";
+  else if (!(age >= -CLOCK_STEP && age <= ISSUED_TTL)) untagged = "the command was registered too long after its launch";
+  else if (!Number.isFinite(started)) untagged = "the start time of the command is unknown";
+  const tag = untagged ? null : split.tag;
   const raw = {
     id,
     sessionID,
@@ -193,6 +210,7 @@ function onCreated(state, io, info, location) {
     file: info.file,
     command: stripTags(info.command),
     tag,
+    untagged,
     shell: String(info.shell ?? ""),
     cwd: info.cwd,
     dir: location.directory,
@@ -212,7 +230,7 @@ function activate(state, io, inst, raw) {
   const { settings, notes } = resolveSettings(inst.settings, directive);
   if (killArmed(settings) && !raw.tag) {
     for (const key of KILL_SETTINGS) settings[key] = 0;
-    notes.push("kill limits (automatic kill needs macOS or Linux and one of sh, bash, zsh, dash, ash, fish)");
+    notes.push(`kill limits (${raw.untagged})`);
   }
   state.shells.set(raw.id, createRecord(raw, settings, notes));
   (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
@@ -284,6 +302,11 @@ export async function tick(state, io, inst) {
     const raw = state.lastTick === null ? 0 : mono - state.lastTick;
     const gap = raw < 0 || raw > 2 * tickMs;
     const delta = gap ? 0 : raw;
+    // The wall clock was set back: what was learned from start times and from the order of events is
+    // not worth anything now, and nothing may be killed on the strength of it.
+    const wall = io.wall();
+    if (state.lastWall !== null && wall - state.lastWall < raw - CLOCK_STEP) distrust(state, io);
+    state.lastWall = wall;
     state.lastTick = mono;
     state.obs += delta;
     const run = { state, io, held, delta, gap };
@@ -291,6 +314,7 @@ export async function tick(state, io, inst) {
     sweep(run);
     await escalate(run);
     if (held()) await observe(run);
+    if (held()) await identify(run);
     if (held()) await enforce(run);
     if (held()) await deliver(run);
   } finally {
@@ -413,21 +437,71 @@ async function observe({ state, io, held, delta, gap }) {
   }
 }
 
-/**
- * The process table and the command line of one pid, read independently: one may fail without
- * spoiling the other. processes: array or null; argv: string ("" when there is no such process) or null.
- */
-async function readProcesses(io, pid) {
-  const [processes, argv] = await Promise.allSettled([io.processes(), io.argv(pid)]);
-  return {
-    processes: processes.status === "fulfilled" && Array.isArray(processes.value) ? processes.value : null,
-    argv: argv.status === "fulfilled" && typeof argv.value === "string" ? argv.value : null,
-  };
-}
-
 function disarm(rec) {
   for (const key of KILL_SETTINGS) rec.settings[key] = 0;
   rec.rev += 1;
+}
+
+/** Takes the kill limits from a command for good, and says so if it had any. */
+function unbind(state, rec, why) {
+  const armed = killArmed(rec.settings);
+  rec.tag = null;
+  rec.birth = null;
+  disarm(rec);
+  if (!armed) return;
+  rec.notes.push(`kill limits (${why})`);
+  notify(state, rec, killOffNotice(rec, why));
+}
+
+/** After the clock went back: no kill limit, pending SIGKILL or remembered start is trusted any more. */
+function distrust(state, io) {
+  io.log({ kind: "clock-set-back" });
+  for (const rec of state.shells.values()) {
+    if (rec.tag && !rec.killed) unbind(state, rec, "because the system clock was set back");
+  }
+  state.terminating.clear();
+  state.issued.clear();
+  state.pids.clear();
+}
+
+/** What ps says about one pid: { pgid, birth, argv }, null when there is no such process, undefined when ps failed. */
+async function look(io, pid) {
+  try {
+    return await io.inspect(pid);
+  } catch {
+    return undefined;
+  }
+}
+
+async function table(io) {
+  try {
+    const processes = await io.processes();
+    return Array.isArray(processes) ? processes : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Binds the kill limits of a freshly tagged command to its process: the first time the process is
+ * seen carrying the tag, its birth is noted, and from then on only that process can be signalled.
+ */
+async function identify({ state, io, held }) {
+  for (const rec of [...state.shells.values()]) {
+    if (state.shells.get(rec.id) !== rec || !rec.tag || rec.birth || !ownerOf(state, rec)) continue;
+    const seen = await look(io, rec.pid);
+    if (!held()) return;
+    if (state.shells.get(rec.id) !== rec || !rec.tag || rec.birth || !ownerOf(state, rec)) continue;
+    if (seen === undefined) {
+      if (++rec.identityTries >= IDENTITY_TRIES) unbind(state, rec, "because its process could not be read");
+      continue;
+    }
+    const found = captureBirth(seen, rec);
+    if (found.error) {
+      unbind(state, rec, `because ${found.error}`);
+      log(state, io, rec, { kind: "identity-refused", id: rec.id, pid: rec.pid, why: found.error });
+    } else rec.birth = found.birth;
+  }
 }
 
 /** Automatic kill, for commands that were launched with a kill limit. */
@@ -437,11 +511,17 @@ async function enforce({ state, io, held }) {
     const reason = killReason(rec);
     if (!reason) continue;
     const rev = rec.rev;
-    const { processes, argv } = await readProcesses(io, rec.pid);
+    const current = () => state.shells.get(rec.id) === rec && rec.rev === rev && ownerOf(state, rec) !== null;
+    // The group first, the leader last: the signal follows the check of the leader with nothing in
+    // between, and the list of the group is from a moment when the leader was the same process.
+    const processes = await table(io);
     if (!held()) return;
-    if (state.shells.get(rec.id) !== rec || rec.rev !== rev || !ownerOf(state, rec)) continue;
+    if (!current()) continue;
+    const seen = await look(io, rec.pid);
+    if (!held()) return;
+    if (!current()) continue;
 
-    let refusal = verifyLeader(processes, argv, rec);
+    let refusal = verifyLeader(seen, rec) ?? (processes ? null : "the process list could not be read");
     if (!refusal) {
       try {
         io.signalGroup(rec.pid, "SIGTERM");
@@ -463,10 +543,11 @@ async function enforce({ state, io, held }) {
       workspace: rec.workspace,
       pid: rec.pid,
       tag: rec.tag,
+      birth: rec.birth,
       startedWall: rec.startedWall,
+      members: membersOf(processes, rec.pid),
       setting: reason.setting,
       termObs: state.obs,
-      termWall: io.wall(),
     });
     notify(state, rec, killNotice(rec, reason));
     log(state, io, rec, { kind: "kill", id: rec.id, pid: rec.pid, why: reason.text });
@@ -483,12 +564,15 @@ async function escalate({ state, io, held }) {
       state.terminating.delete(entry.id);
       continue;
     }
-    const { processes, argv } = await readProcesses(io, entry.pid);
+    const processes = await table(io);
+    if (!held()) return;
+    if (!permitted()) continue;
+    const seen = await look(io, entry.pid);
     if (!held()) return;
     if (!permitted()) continue;
 
     state.terminating.delete(entry.id);
-    let refusal = verifySurvivors(processes, argv, entry);
+    let refusal = verifySurvivors(processes, seen, entry);
     if (!refusal) {
       try {
         io.signalGroup(entry.pid, "SIGKILL");

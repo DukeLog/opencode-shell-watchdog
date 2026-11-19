@@ -3,7 +3,7 @@
 import { execFile } from "node:child_process";
 import { appendFile, mkdir, open, stat } from "node:fs/promises";
 import { dirname } from "node:path";
-import { parseProcesses } from "./core.js";
+import { parseInspect, parseProcesses } from "./core.js";
 
 const PS_TIMEOUT = 5_000;
 
@@ -68,20 +68,30 @@ export function createIO({ log: logFile = "", ps: psCommand = "ps", psTimeout = 
       process.kill(-pgid, signal);
     },
 
-    /** Every process: [{ pid, pgid, startedWall }]. */
+    /** Every process: [{ pid, pgid, birth }]. */
     processes() {
-      return ps(["-A", "-o", "pid=,pgid=,etime="]).then((text) => parseProcesses(text, Date.now()));
+      return ps(["-A", "-o", "pid=,pgid=,lstart="]).then(parseProcesses);
     },
 
-    /** Command line of one process as ps prints it; "" when there is no such process. */
-    argv(pid) {
-      return ps(["-ww", "-o", "command=", "-p", String(pid)]).catch((error) => {
-        // ps exits with 1 and prints nothing at all when the pid does not exist. Anything else,
-        // a complaint on stderr included, is a failure and must not pass for "no such process".
-        const silent = String(error?.stdout ?? "").trim() === "" && String(error?.stderr ?? "").trim() === "";
-        if (error?.code === 1 && !error.killed && silent) return "";
-        throw error;
-      });
+    /**
+     * One process in a single reading, so that its parts belong together: { pgid, birth, argv }.
+     * null when there is no such process; an error when ps fails or prints something else.
+     */
+    inspect(pid) {
+      return ps(["-ww", "-o", "pgid=,lstart=,command=", "-p", String(pid)]).then(
+        (text) => {
+          const seen = parseInspect(text);
+          if (!seen) throw new Error("ps printed something unexpected");
+          return seen;
+        },
+        (error) => {
+          // ps exits with 1 and prints nothing at all when the pid does not exist. Anything else,
+          // a complaint on stderr included, is a failure and must not pass for "no such process".
+          const silent = String(error?.stdout ?? "").trim() === "" && String(error?.stderr ?? "").trim() === "";
+          if (error?.code === 1 && !error.killed && silent) return null;
+          throw error;
+        },
+      );
     },
 
     log(entry) {

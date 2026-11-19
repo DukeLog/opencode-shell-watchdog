@@ -391,9 +391,12 @@ export function createRecord(raw, settings, notes = []) {
     lastReport: 0,
     checkAt: 0,
 
-    // Automatic kill. tag: the unique id written into the command at launch (null: kill impossible).
-    // killed is set once SIGTERM went out.
+    // Automatic kill needs both: tag, the unique id written into the command at launch, and birth,
+    // the start time of the process found carrying that tag (see captureBirth). killed is set once
+    // SIGTERM went out.
     tag: raw.tag ?? null,
+    birth: null,
+    identityTries: 0,
     killed: null,
   };
 }
@@ -528,7 +531,7 @@ export const killArmed = (settings) => settings.killSilence > 0 || settings.kill
 
 /** Why the command must be killed now, or null. Silence needs the output as this pass saw it. */
 export function killReason(rec) {
-  if (rec.killed || !rec.tag) return null;
+  if (rec.killed || !rec.tag || !rec.birth) return null;
   const { killRuntime, killSilence } = rec.settings;
   if (killRuntime > 0 && rec.clock >= killRuntime) {
     return { setting: "killRuntime", text: `ran for ${formatDuration(rec.clock)}, limit kill-runtime=${formatSetting(killRuntime)}` };
@@ -592,50 +595,95 @@ function hasTag(argv, tag) {
   return script.startsWith(line) && /^(\s|\\012|$)/.test(script.slice(line.length));
 }
 
+// The tag says what a process was started with; it does not say which process it is. The same text
+// can be run again, and a pid can go to another process without anybody telling. So a kill limit is
+// bound to one process of the operating system: the start time ps reports for it ("birth"), read in
+// the same call as its command line and process group.
+//
+// What remains assumed: a pid is not given to a new process within about two seconds of the start
+// of the process that had it, and not between a check and the signal that follows it.
+const BIRTH_EARLY = 1000;
+const BIRTH_LATE = 2000;
+const BIRTH = String.raw`[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d+\s+\d+:\d+:\d+\s+\d+`;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** "Thu Nov 19 14:34:54 2026", the local time ps prints with LC_ALL=C, in milliseconds; NaN if not that. */
+export function birthTime(birth) {
+  const match = /^[A-Za-z]{3} ([A-Za-z]{3}) (\d+) (\d+):(\d+):(\d+) (\d+)$/.exec(String(birth ?? ""));
+  const month = match ? MONTHS.indexOf(match[1].toLowerCase()) : -1;
+  if (month < 0) return Number.NaN;
+  return new Date(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5])).getTime();
+}
+
+const oneSpace = (text) => text.trim().replace(/\s+/g, " ");
+
+/** `ps -A -o pid=,pgid=,lstart=` → [{ pid, pgid, birth }]. */
+export function parseProcesses(text) {
+  const line = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${BIRTH})\s*$`);
+  const processes = [];
+  for (const row of String(text).split("\n")) {
+    const match = line.exec(row);
+    if (match) processes.push({ pid: Number(match[1]), pgid: Number(match[2]), birth: oneSpace(match[3]) });
+  }
+  return processes;
+}
+
 /**
- * May SIGTERM go to the process group of this pid? argv: command line of the pid as ps prints it;
- * processes: [{pid, pgid, startedWall}]. Returns null when it may, else the reason to refuse.
+ * `ps -ww -o pgid=,lstart=,command= -p <pid>` → { pgid, birth, argv }: one process in one reading.
+ * Returns null for text that is not such a line.
  */
-export function verifyLeader(processes, argv, target) {
-  if (!target.tag) return "the command was not launched with a kill limit";
-  if (!Array.isArray(processes) || typeof argv !== "string") return "the process list could not be read";
-  if (!hasTag(argv, target.tag)) return `process ${target.pid} is not the command that was launched`;
-  const leader = processes.find((proc) => proc.pid === target.pid);
-  if (!leader) return `process ${target.pid} was not found`;
-  if (leader.pgid !== target.pid) return `process ${target.pid} does not lead its own process group`;
+export function parseInspect(text) {
+  const match = new RegExp(String.raw`^\s*(\d+)\s+(${BIRTH})\s+([\s\S]*)$`).exec(String(text).trimEnd());
+  return match ? { pgid: Number(match[1]), birth: oneSpace(match[2]), argv: match[3] } : null;
+}
+
+/**
+ * The first look at the process of a tagged command: is it the process that was started for it?
+ * seen: what ps says about the pid ({ pgid, birth, argv }), or null when there is no such process.
+ * Returns { birth } to bind the kill limit to, or { error }.
+ */
+export function captureBirth(seen, rec) {
+  if (!seen) return { error: `process ${rec.pid} was not found` };
+  if (!hasTag(seen.argv, rec.tag)) return { error: `process ${rec.pid} is not the command that was launched` };
+  if (seen.pgid !== rec.pid) return { error: `process ${rec.pid} does not lead its own process group` };
+  // ps cuts the start time down to the second; the command's own start time was taken at the spawn.
+  const late = rec.startedWall - birthTime(seen.birth);
+  if (!(late >= -BIRTH_EARLY && late <= BIRTH_LATE)) return { error: `process ${rec.pid} did not start when the command was started` };
+  return { birth: seen.birth };
+}
+
+/**
+ * May SIGTERM go to the process group of this pid? seen: what ps says about the pid now, null when
+ * there is no such process, undefined when ps failed. Returns null when it may, else the reason.
+ */
+export function verifyLeader(seen, target) {
+  if (!target.tag || !target.birth) return "the command has no kill limit bound to its process";
+  if (seen === undefined) return "the process could not be read";
+  if (seen === null) return `process ${target.pid} was not found`;
+  if (seen.birth !== target.birth) return `pid ${target.pid} now belongs to another process`;
+  if (!hasTag(seen.argv, target.tag)) return `process ${target.pid} is not the command that was launched`;
+  if (seen.pgid !== target.pid) return `process ${target.pid} does not lead its own process group`;
   return null;
 }
 
-// ps tells elapsed time in whole seconds, so a start time is known to a second either way. A process
-// counts as older than the SIGTERM only when it is older beyond that doubt.
-const START_SLACK = 2000;
-
-/**
- * After SIGTERM: may the group be killed? Only when the leader is gone or still the tagged command, and
- * the group holds a process that existed before the signal (a reused group id has only younger ones).
- * argv: command line of the leader pid; "" when ps found no such process, null when ps failed.
- * Returns null when it may, else the reason to refuse.
- */
-export function verifySurvivors(processes, argv, entry) {
-  if (!Array.isArray(processes)) return "the process list could not be read";
-  const leader = processes.some((proc) => proc.pid === entry.pid) && argv !== "";
-  if (leader && typeof argv !== "string") return `process ${entry.pid} could not be checked`;
-  if (leader && !hasTag(argv, entry.tag)) return `pid ${entry.pid} now belongs to another process`;
-  const survivor = processes.some((proc) => proc.pgid === entry.pid && proc.startedWall + START_SLACK <= entry.termWall);
-  return survivor ? null : `no process of group ${entry.pid} predates the SIGTERM`;
+/** The processes of a group, each with its birth: who is in it right now. */
+export function membersOf(processes, pgid) {
+  return processes.filter((proc) => proc.pgid === pgid).map(({ pid, birth }) => ({ pid, birth }));
 }
 
-/** `ps -A -o pid=,pgid=,etime=` → [{pid, pgid, startedWall}]. */
-export function parseProcesses(text, wall) {
-  const processes = [];
-  for (const line of String(text).split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(line);
-    if (!match) continue;
-    const [, pid, pgid, days = 0, hours = 0, minutes, seconds] = match;
-    const elapsed = ((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds);
-    processes.push({ pid: Number(pid), pgid: Number(pgid), startedWall: wall - elapsed * 1000 });
-  }
-  return processes;
+/**
+ * After SIGTERM: may the group be killed? Only when the leader is gone or still the same process,
+ * and the group holds a process that was in it when the SIGTERM went out (entry.members): a group id
+ * that was given out again has none of those. No clock is involved.
+ * Returns null when it may, else the reason to refuse.
+ */
+export function verifySurvivors(processes, seen, entry) {
+  if (!Array.isArray(processes)) return "the process list could not be read";
+  if (seen === undefined && processes.some((proc) => proc.pid === entry.pid)) return `process ${entry.pid} could not be checked`;
+  if (seen && (seen.birth !== entry.birth || !hasTag(seen.argv, entry.tag))) return `pid ${entry.pid} now belongs to another process`;
+  const known = (proc) => entry.members.some((member) => member.pid === proc.pid && member.birth === proc.birth);
+  const survivor = processes.some((proc) => proc.pgid === entry.pid && known(proc));
+  return survivor ? null : `no process of group ${entry.pid} is left from before the SIGTERM`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -804,6 +852,10 @@ export function budgetFooter(maxWakes, freeIn) {
 
 export function killNotice(rec, reason) {
   return `${TAG} ${rec.id} was stopped by the watchdog: ${reason.text}. SIGTERM was sent to process group ${rec.pid}.\n$ ${shortCommand(rec.command)}`;
+}
+
+export function killOffNotice(rec, why) {
+  return `${TAG} ${rec.id}: automatic kill is off for this command, ${why}. Its kill limits will not be applied.\n$ ${shortCommand(rec.command)}`;
 }
 
 export function killRefusedNotice(rec, reason, why) {
