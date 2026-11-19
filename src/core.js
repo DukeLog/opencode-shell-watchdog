@@ -391,8 +391,9 @@ export function createRecord(raw, settings, notes = []) {
     checkAt: 0,
 
     // Automatic kill. tag: the id of the guard that was started with the command (null: no kill
-    // limit possible); claim: the directory that guard was told to claim. bound: the guard was seen
-    // to have claimed it for this very shell. killed: set when the guard is told to stop the command.
+    // limit possible); claim: the path that guard was told to make its claim at. bound: the guard
+    // was seen to have made it for this very shell. killed: set when the guard is told to stop the
+    // command.
     tag: raw.tag ?? null,
     claim: raw.claim ?? null,
     bound: false,

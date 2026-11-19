@@ -327,9 +327,13 @@ test("claims: a part of the directory for every server; read, stop, take back, d
   await io.cancelStop(claim);
   await io.cancelStop(claim);
   assert.equal(existsSync(`${claim}.stop`), false);
+  await io.requestStop(claim);
   await io.dropClaim(claim);
   await io.dropClaim(claim);
   assert.equal(await io.readClaim(claim), null);
+  assert.equal(existsSync(`${claim}.stop`), false, "a claim leaves nothing behind");
+  await assert.rejects(io.requestStop(claim), "a claim that nobody made cannot be told to stop");
+  assert.equal(existsSync(`${claim}.stop`), false);
 
   // Every server has a part of its own, and none ever removes another's, however old it looks:
   // a guard of a long-running command may be at work in it.

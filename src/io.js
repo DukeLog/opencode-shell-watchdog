@@ -88,10 +88,14 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
       await rm(`${claim}.stop`, { force: true });
     },
 
-    /** Removes a claim that is not needed any more; its guard, if still there, leaves. */
+    /**
+     * Removes a claim that is not needed any more; its guard, if still there, leaves. The stop goes
+     * first, so that removing a claim never stops anything; both files are tried in any case.
+     */
     async dropClaim(claim) {
+      const stop = await rm(`${claim}.stop`, { force: true }).then(() => null, (error) => error);
       await rm(`${claim}.pid`, { force: true });
-      await rm(`${claim}.stop`, { force: true });
+      if (stop) throw stop;
     },
 
     log(entry) {
