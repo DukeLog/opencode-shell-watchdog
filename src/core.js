@@ -391,9 +391,10 @@ export function createRecord(raw, settings, notes = []) {
     checkAt: 0,
 
     // Automatic kill. tag: the id of the guard that was started with the command (null: no kill
-    // limit possible). bound: the guard was seen to have claimed that id for this very shell.
-    // killed: set once the guard was told to stop the command.
+    // limit possible); claim: the directory that guard was told to claim. bound: the guard was seen
+    // to have claimed it for this very shell. killed: set when the guard is told to stop the command.
     tag: raw.tag ?? null,
+    claim: raw.claim ?? null,
     bound: false,
     claimTries: 0,
     killed: null,
@@ -546,47 +547,69 @@ export function killReason(rec) {
 //
 // The watchdog never sends a signal. Telling which process a pid belongs to cannot be done safely from
 // outside: pids are given out again, and what `ps` says is already old when it is read. Instead, a
-// command that is launched with a kill limit gets two lines in front of it:
+// command that is launched with a kill limit gets two lines in front of it and one variable in its
+// environment:
 //
-//     # shell-watchdog:<id>          a random id, new for every launch
-//     ( ( … ) & ) # shell-watchdog guard
+//     # shell-watchdog:<id>                  a random id, new for every launch
+//     ( '/bin/sh' '-c' '…' … & ); … # shell-watchdog guard
+//     SHELL_WATCHDOG_CLAIM=<claims>/<id>     in the environment of that one launch
 //
-// The second line starts a guard: a small loop in the command's own process group. It claims the id
-// by creating the directory <claims>/<id> (only the first to try can), writes the pid of its shell
-// there, and then waits for the file <claims>/<id>/stop. When the watchdog creates that file, the
-// guard sends SIGTERM and, a few seconds later, SIGKILL to the process group led by its shell, which
-// is the group it lives in itself. Whatever happens to pids meanwhile, a guard can only ever stop the
-// group it was started in, and that group cannot be given to anybody else while the guard is in it.
-// A shell that does not lead a group of its own gets no guard at all: the line gives up at once.
+// The second line starts a guard: a small loop in a plain /bin/sh, in the command's own process group.
+// The guard
+//   - takes the path of its claim from the environment. The text of a command can be copied and run
+//     again anywhere; the environment of one launch cannot, and the line removes the variable from
+//     the command's shell at once, so that not even the command's own children inherit it;
+//   - goes on only if it is a member of the process group led by the command's shell;
+//   - claims the id by creating the directory (only the first to try can) and writes the pid of the
+//     command's shell there;
+//   - waits for the file <claim>/stop. When the watchdog creates it, the guard sends SIGTERM and, a
+//     few seconds later, SIGKILL to the process group it is in.
+// As long as the guard lives, that group exists and its id cannot be given to anything else. So a
+// guard can only ever stop the group it was started in, whatever happens to pids, clocks or events.
 //
-// The guard is not a child of the command's shell (it is started from a subshell that exits at
-// once), so `wait`, `jobs` and `$!` of the command do not see it. It leaves when the shell is gone or
-// its claim is removed.
+// Nothing in the line depends on the user's shell setup: every word is quoted (no alias applies),
+// /bin/sh is called by its path, and inside it the tools are found on the system's default path,
+// past any function of the same name.
+//
+// The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
+// `jobs` and `$!` do not see it. It leaves when the command's shell is gone or its claim is removed.
 const TAG_PREFIX = "# shell-watchdog:";
 const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/i;
 const GUARD_MARK = " # shell-watchdog guard";
 const GUARD_LINE = /^[^\n]* # shell-watchdog guard\r?\n/;
+export const CLAIM_ENV = "SHELL_WATCHDOG_CLAIM";
 export const GUARD_POLL = 3;
 export const GUARD_GRACE = 5;
 
 export const tagLine = (tag) => `${TAG_PREFIX}${tag}`;
 
-const quote = (text) => `'${text.replace(/'/g, `'\\''`)}'`;
-
-/** The line that starts the guard of a command. dir: the claims directory; poll, grace: whole seconds. */
-export function guardLine(tag, dir, { poll = GUARD_POLL, grace = GUARD_GRACE } = {}) {
-  const claim = quote(`${dir}/${tag}`);
-  // "-$$" is the group led by the shell. Never group 0: that is whatever group the guard happens to
-  // be in, and only the first of the two is known to be the command's. No "--" before it: dash and
-  // BusyBox ash do not take one.
-  const stop = `kill -TERM "-$$"; sleep ${grace}; kill -KILL "-$$"; exit 0`;
-  const loop = `while kill -0 "$$" 2>/dev/null && [ -d "$d" ]; do if [ -e "$d/stop" ]; then ${stop}; fi; sleep ${poll}; done`;
-  const claimIt = `kill -0 "-$$" 2>/dev/null && mkdir "$d" 2>/dev/null && echo "$$" > "$d/pid" || exit 0`;
-  return `( ( trap '' TERM; d=${claim}; ${claimIt}; ${loop} ) </dev/null >/dev/null 2>&1 & )${GUARD_MARK}`;
+/**
+ * What the guard runs, for /bin/sh; $1 is the pid of the command's shell. One line, and no single
+ * quote in it: it travels inside a pair of them. poll, grace: whole seconds.
+ */
+export function guardScript({ poll = GUARD_POLL, grace = GUARD_GRACE } = {}) {
+  const stop = `command kill -TERM "-$1"; command -p sleep ${grace} || exit 0; command kill -KILL "-$1"; exit 0`;
+  return [
+    `d=$${CLAIM_ENV}`,
+    `command test -n "$d" || exit 0`,
+    `unset ${CLAIM_ENV}`,
+    `trap "" TERM`,
+    // Own process group, as ps knows it: it has to be the one led by the command's shell.
+    `g=$(command -p ps -o pgid= -p "$$" | command -p tr -d "[:space:]")`,
+    `command test "$g" = "$1" || exit 0`,
+    `command -p mkdir "$d" 2>/dev/null || exit 0`,
+    `command echo "$1" > "$d/pid" || exit 0`,
+    `while command kill -0 "$1" 2>/dev/null && command test -d "$d"; do if command test -e "$d/stop"; then ${stop}; fi; command -p sleep ${poll} || exit 0; done`,
+  ].join("; ");
 }
 
-export function addTag(command, tag, dir, timing) {
-  return `${tagLine(tag)}\n${guardLine(tag, dir, timing)}\n${command}`;
+/** The line that starts the guard of a command and takes the claim out of the command's own environment. */
+export function guardLine(timing) {
+  return `( '/bin/sh' '-c' '${guardScript(timing)}' 'sh' "$$" <'/dev/null' >'/dev/null' 2>&1 & ); 'unset' '${CLAIM_ENV}'${GUARD_MARK}`;
+}
+
+export function addTag(command, tag, timing) {
+  return `${tagLine(tag)}\n${guardLine(timing)}\n${command}`;
 }
 
 /** Splits the tag lines off a command: { tag, command }. tag is null when there is none. */

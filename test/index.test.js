@@ -7,12 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import plugin from "../src/index.js";
-import { guardLine, splitTag } from "../src/core.js";
+import { CLAIM_ENV, guardLine, splitTag } from "../src/core.js";
 
 // The plugin keeps the claims of guards under the state directory: give it one of its own here.
 const STATE = mkdtempSync(join(tmpdir(), "watchdog-state-"));
 process.env.XDG_STATE_HOME = STATE;
-const CLAIMS = join(STATE, "opencode-shell-watchdog", "claims");
+// Every server process has a part of its own in there.
+const claims = () => join(STATE, "opencode-shell-watchdog", "claims", sharedState().space);
 after(() => rmSync(STATE, { recursive: true, force: true }));
 import { follow, sleep } from "../src/stream.js";
 import { sharedState } from "../src/watchdog.js";
@@ -71,8 +72,9 @@ test("setup registers the hook, the tool and one instance; cleanup takes all of 
   assert.equal(plugin.id, "shell-watchdog");
   assert.deepEqual(ctx.hooks.map((hook) => hook.name), ["create.before"]);
   assert.equal(instancesAt("/index-1").length, 1);
-  assert.equal(instancesAt("/index-1")[0].claims, CLAIMS);
-  assert.ok(existsSync(CLAIMS), "the claims directory is made at setup");
+  assert.match(sharedState().space, /^[0-9a-f-]{36}$/);
+  assert.equal(instancesAt("/index-1")[0].claims, claims());
+  assert.ok(existsSync(claims()), "the claims directory is made at setup");
   assert.equal(ctx.streams.length, 1);
   assert.deepEqual(ctx.streams[0].types, ["shell.created", "shell.exited", "shell.deleted", "session.deleted"]);
 
@@ -98,59 +100,71 @@ test("setup registers the hook, the tool and one instance; cleanup takes all of 
   assert.equal(ctx.streams[0].signal.aborted, true);
 });
 
-test("the hook gives every launch of a kill-limited command a tag of its own", async () => {
+test("the hook gives every launch of a kill-limited command a guard and a claim of its own", async () => {
   const ctx = fakeContext({ directory: "/index-2" });
   const cleanup = await plugin.setup(ctx);
+  const launch = (command, env = { PATH: "/bin" }) => ({ command, shell: "/bin/zsh", env: { ...env } });
   try {
     const [{ run }] = ctx.hooks;
-    const plain = { command: "./job.sh", shell: "/bin/zsh" };
+    const plain = launch("./job.sh");
     await run(plain);
-    assert.equal(plain.command, "./job.sh", "no kill limit: the command is not touched");
-    const directed = { command: "# watchdog: report=5m\n./job.sh", shell: "/bin/zsh" };
+    assert.deepEqual(plain, launch("./job.sh"), "no kill limit: neither the command nor its environment is touched");
+    const directed = launch("# watchdog: report=5m\n./job.sh");
     await run(directed);
-    assert.equal(directed.command, "# watchdog: report=5m\n./job.sh");
+    assert.deepEqual(directed, launch("# watchdog: report=5m\n./job.sh"));
 
     const text = "# watchdog: kill-runtime=2h\n./job.sh";
-    const first = { command: text, shell: "/bin/zsh" };
-    const second = { command: text, shell: "/bin/zsh" };
+    const first = launch(text);
+    const second = launch(text);
     await run(first);
     await run(second);
     const tags = [splitTag(first.command), splitTag(second.command)];
     assert.match(tags[0].tag, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.notEqual(tags[0].tag, tags[1].tag);
     assert.deepEqual(tags.map((split) => split.command), [text, text]);
-    assert.deepEqual(first.command.split("\n").slice(1), [guardLine(tags[0].tag, CLAIMS), ...text.split("\n")]);
+    assert.deepEqual(first.command.split("\n").slice(1), [guardLine(), ...text.split("\n")]);
+    assert.deepEqual(first.env, { PATH: "/bin", [CLAIM_ENV]: join(claims(), tags[0].tag) }, "the claim travels in the environment only");
+    assert.equal(second.env[CLAIM_ENV], join(claims(), tags[1].tag));
 
-    // The already tagged text launched once more: the old tag is not taken over.
-    const again = { command: first.command, shell: "/bin/zsh" };
+    // The already tagged text launched once more, with the old claim still in the environment (as a
+    // child of the first command would have it): neither the old id nor the old claim is taken over.
+    const again = launch(first.command, first.env);
     await run(again);
-    assert.notEqual(splitTag(again.command).tag, tags[0].tag);
+    const fresh = splitTag(again.command);
+    assert.notEqual(fresh.tag, tags[0].tag);
     assert.equal(again.command.match(/# shell-watchdog:/g).length, 1);
-    assert.equal(splitTag(again.command).command, text);
+    assert.equal(fresh.command, text);
+    assert.equal(again.env[CLAIM_ENV], join(claims(), fresh.tag));
 
-    for (const split of [...tags, splitTag(again.command)]) assert.ok(sharedState().issued.has(split.tag));
+    // The same without a kill limit: tag lines and claim are simply removed.
+    const unlimited = launch(first.command.replace("kill-runtime=2h", "report=5m"), first.env);
+    await run(unlimited);
+    assert.deepEqual(unlimited, launch("# watchdog: report=5m\n./job.sh"));
+
+    for (const split of [...tags, fresh]) assert.equal(sharedState().issued.get(split.tag).claim, join(claims(), split.tag));
   } finally {
     sharedState().issued.clear();
     await cleanup();
   }
 
   // After cleanup the hook of the old instance does nothing.
-  const late = { command: "# watchdog: kill-runtime=2h\n./job.sh", shell: "/bin/zsh" };
+  const late = launch("# watchdog: kill-runtime=2h\n./job.sh");
   await ctx.hooks[0].run(late);
-  assert.equal(late.command, "# watchdog: kill-runtime=2h\n./job.sh");
+  assert.deepEqual(late, launch("# watchdog: kill-runtime=2h\n./job.sh"));
 });
 
-test("a kill limit from the plugin options tags every command", async () => {
+test("a kill limit from the plugin options gives every command a guard", async () => {
   const ctx = fakeContext({ directory: "/index-3", options: { killRuntime: "6h" } });
   const cleanup = await plugin.setup(ctx);
   try {
-    const event = { command: "./job.sh", shell: "/bin/bash" };
+    const event = { command: "./job.sh", shell: "/bin/bash", env: {} };
     await ctx.hooks[0].run(event);
     assert.equal(splitTag(event.command).command, "./job.sh");
     assert.notEqual(splitTag(event.command).tag, null);
-    const off = { command: "# watchdog: kill-runtime=off\n./job.sh", shell: "/bin/bash" };
+    assert.equal(event.env[CLAIM_ENV], join(claims(), splitTag(event.command).tag));
+    const off = { command: "# watchdog: kill-runtime=off\n./job.sh", shell: "/bin/bash", env: {} };
     await ctx.hooks[0].run(off);
-    assert.equal(off.command, "# watchdog: kill-runtime=off\n./job.sh");
+    assert.deepEqual(off, { command: "# watchdog: kill-runtime=off\n./job.sh", shell: "/bin/bash", env: {} });
   } finally {
     sharedState().issued.clear();
     await cleanup();

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  CLAIM_ENV,
   OPTION_DEFAULTS,
   SETTING_DEFAULTS,
   absorb,
@@ -17,6 +18,7 @@ import {
   formatDuration,
   killReason,
   guardLine,
+  guardScript,
   learnedOf,
   MESSAGE_CAP,
   parseDirective,
@@ -463,11 +465,11 @@ test("tag: wanted only when a kill limit is armed and the shell can carry it", (
 
 test("tag: two lines in front of the command, both removed again", () => {
   const command = "# watchdog: kill-runtime=2h\n./job.sh";
-  const tagged = addTag(command, TAG, "/state/claims");
+  const tagged = addTag(command, TAG);
   const lines = tagged.split("\n");
   assert.equal(lines.length, 4);
   assert.equal(lines[0], `# shell-watchdog:${TAG}`);
-  assert.equal(lines[1], guardLine(TAG, "/state/claims"));
+  assert.equal(lines[1], guardLine());
   assert.ok(lines[1].endsWith(" # shell-watchdog guard"));
   assert.deepEqual(splitTag(tagged), { tag: TAG, command });
   assert.deepEqual(parseDirective(splitTag(tagged).command, "/bin/zsh").pairs, [["kill-runtime", "2h"]], "the directive is the first line again");
@@ -476,20 +478,42 @@ test("tag: two lines in front of the command, both removed again", () => {
   assert.deepEqual(splitTag("./job.sh"), { tag: null, command: "./job.sh" });
   assert.equal(splitTag("echo hi\n# shell-watchdog:" + TAG + "\n").tag, null, "only as the first line");
   assert.equal(splitTag(`# shell-watchdog:${TAG}`).tag, null, "only as a whole line");
-  assert.equal(stripTags(addTag(addTag(command, TAG, "/a"), TAG.replace("0a", "0b"), "/b")), command, "every tag layer is removed");
+  assert.equal(stripTags(addTag(addTag(command, TAG), TAG.replace("0a", "0b"))), command, "every tag layer is removed");
   assert.equal(stripTags(command), command);
 });
 
-test("the guard line: one line of plain sh, with the claim path safely quoted", () => {
-  const line = guardLine(TAG, "/home/it's me/state dir/claims");
+test("the guard line: the same for every command, immune to the user's shell, and sure of its group", () => {
+  const line = guardLine();
+  const script = guardScript();
+  assert.equal(line, guardLine(), "nothing of one launch is in the text: the claim comes with the environment");
   assert.doesNotMatch(line, /\n/);
-  assert.ok(line.includes(`d='/home/it'\\''s me/state dir/claims/${TAG}';`), line);
-  // The id can be claimed once, by a shell that leads its own group; the group it stops is that one.
-  assert.match(line, /kill -0 "-\$\$" 2>\/dev\/null && mkdir "\$d" 2>\/dev\/null && echo "\$\$" > "\$d\/pid" \|\| exit 0;/);
-  assert.match(line, /while kill -0 "\$\$" 2>\/dev\/null && \[ -d "\$d" \]; do if \[ -e "\$d\/stop" \]; then kill -TERM "-\$\$"; sleep 5; kill -KILL "-\$\$"; exit 0; fi; sleep 3; done/);
-  assert.doesNotMatch(line, /kill -[A-Z]+ 0\b/, "never the group the guard merely happens to be in");
-  assert.match(line, /^\( \( trap '' TERM; .* \) <\/dev\/null >\/dev\/null 2>&1 & \) # shell-watchdog guard$/);
-  assert.match(guardLine(TAG, "/c", { poll: 1, grace: 2 }), /sleep 2; kill -KILL "-\$\$"; exit 0; fi; sleep 1; done/);
+  assert.doesNotMatch(script, /'/, "the script travels inside single quotes");
+  assert.equal(line, `( '/bin/sh' '-c' '${script}' 'sh' "$$" <'/dev/null' >'/dev/null' 2>&1 & ); 'unset' '${CLAIM_ENV}' # shell-watchdog guard`);
+  assert.equal(CLAIM_ENV, "SHELL_WATCHDOG_CLAIM");
+
+  // Outside the script every word is quoted, so no alias applies, and the shell is called by its path.
+  const outside = line.replace(`'${script}'`, "'…'").replace(/ # shell-watchdog guard$/, "");
+  for (const word of outside.split(/\s+/)) {
+    assert.match(word, /^(\(|\)|\);|&|'[^']*'|"\$\$"|<'[^']*'|>'[^']*'|2>&1)$/, `unquoted word: ${word}`);
+  }
+
+  // Inside: the claim from the environment, taken out of it at once; the guard's own group checked;
+  // one claim; tools found past functions and the user's PATH; every wait checked.
+  const steps = script.split("; ");
+  assert.deepEqual(steps.slice(0, 8), [
+    "d=$SHELL_WATCHDOG_CLAIM",
+    'command test -n "$d" || exit 0',
+    "unset SHELL_WATCHDOG_CLAIM",
+    'trap "" TERM',
+    'g=$(command -p ps -o pgid= -p "$$" | command -p tr -d "[:space:]")',
+    'command test "$g" = "$1" || exit 0',
+    'command -p mkdir "$d" 2>/dev/null || exit 0',
+    'command echo "$1" > "$d/pid" || exit 0',
+  ]);
+  assert.ok(script.endsWith('while command kill -0 "$1" 2>/dev/null && command test -d "$d"; do if command test -e "$d/stop"; then command kill -TERM "-$1"; command -p sleep 5 || exit 0; command kill -KILL "-$1"; exit 0; fi; command -p sleep 3 || exit 0; done'));
+  assert.doesNotMatch(script, /kill -[A-Z0-9]+ "?-?0"?(;| )/, "never the group the guard merely happens to be in");
+  assert.doesNotMatch(script.replace(/command -p (ps|tr|mkdir|sleep)|command (test|echo|kill)/g, ""), /\b(ps|tr|mkdir|sleep|test|echo|kill)\b/, "no tool is called by its bare name");
+  assert.match(guardScript({ poll: 1, grace: 2 }), /command -p sleep 2 \|\| exit 0; command kill -KILL "-\$1"; exit 0; fi; command -p sleep 1 \|\| exit 0; done$/);
 });
 
 const size = (text) => Buffer.byteLength(text, "utf8");
@@ -507,8 +531,8 @@ test("texts are cut by bytes, never inside a character", () => {
 });
 
 test("report text is bounded", () => {
-  assert.equal(shortCommand(addTag("# watchdog: report=5m\n./a.sh\n./b.sh", TAG, "/claims")), "./a.sh … (+1 more lines)");
-  assert.equal(shortCommand(addTag("./job.sh", TAG, "/claims")), "./job.sh", "neither of the two tag lines is shown");
+  assert.equal(shortCommand(addTag("# watchdog: report=5m\n./a.sh\n./b.sh", TAG)), "./a.sh … (+1 more lines)");
+  assert.equal(shortCommand(addTag("./job.sh", TAG)), "./job.sh", "neither of the two tag lines is shown");
   assert.ok(size(shortCommand("x".repeat(5000))) <= 200);
   assert.ok(size(shortCommand(`${"я".repeat(5000)}\nmore`)) <= 200);
   assert.equal(shortCommand(""), "(empty command)");

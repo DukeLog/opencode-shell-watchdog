@@ -6,11 +6,11 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { addTag } from "../src/core.js";
+import { CLAIM_ENV, addTag } from "../src/core.js";
 import { createIO, defaultClaims } from "../src/io.js";
 
 const posix = process.platform !== "win32";
@@ -19,27 +19,34 @@ const SHELLS = ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/bin/dash",
 const FAST = { poll: 1, grace: 1 };
 
 let dir;
-let claims;
+let space;
 let io;
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), "watchdog-io-"));
-  claims = join(dir, "state with a space", "it's claims");
-  io = createIO({ claims, log: join(dir, "logs", "watchdog.log") });
-  assert.equal(await io.prepareClaims(), claims);
+  io = createIO({ claims: join(dir, "state with a space", "it's claims"), log: join(dir, "logs", "watchdog.log") });
+  space = await io.prepareClaims("server-1");
+  assert.equal(space, join(dir, "state with a space", "it's claims", "server-1"));
 });
 after(() => rm(dir, { recursive: true, force: true }));
 
+/** A command with a guard, as the hook launches it: the text, and the environment with the claim. */
+function guarded(script, extraEnv = {}) {
+  const tag = randomUUID();
+  const claim = join(space, tag);
+  return { tag, claim, command: addTag(script, tag, FAST), env: { ...process.env, ...extraEnv, [CLAIM_ENV]: claim } };
+}
+
 /** Starts a command the way OpenCode does: `<shell> -c <command>`, as the leader of its own group. */
-function start(shell, command) {
-  const child = spawn(shell, ["-c", command], { detached: true, stdio: "ignore" });
+function start(shell, command, env = process.env, detached = true) {
+  const child = spawn(shell, ["-c", command], { detached, stdio: "ignore", env });
   const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
   return { pid: child.pid, exited };
 }
 
-/** Runs a command to its end: { code, signal, stdout }. */
-function run(shell, command) {
+/** Runs a command to its end, as the leader of its own group: { code, signal, stdout }. */
+function run(shell, command, env = process.env) {
   return new Promise((resolve) => {
-    const child = spawn(shell, ["-c", command], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(shell, ["-c", command], { detached: true, stdio: ["ignore", "pipe", "ignore"], env });
     let stdout = "";
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.on("close", (code, signal) => resolve({ code, signal, stdout }));
@@ -69,7 +76,19 @@ async function until(check, ms = 8000) {
   return false;
 }
 
-test("a command with a guard behaves like the same command without it", { skip: !posix }, async (t) => {
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function killGroups(...pids) {
+  for (const pid of pids) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+test("a command with a live guard behaves like the same command without one", { skip: !posix }, async (t) => {
   const scripts = [
     "true",
     "(exit 7)",
@@ -87,92 +106,140 @@ test("a command with a guard behaves like the same command without it", { skip: 
     "wait; jobs; echo \"[${!:-none}]\"",
     "set -eu; echo strict; false; echo unreachable",
     "exec sh -c 'echo replaced; exit 9'",
+    // The claim is for the guard alone: the command does not find it in its environment.
+    `echo "[\${${CLAIM_ENV}:-not set}]"; env | grep -c ${CLAIM_ENV}`,
   ];
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
       for (const script of scripts) {
+        const job = guarded(script);
         const started = Date.now();
-        const [plain, tagged] = await Promise.all([run(shell, script), run(shell, addTag(script, randomUUID(), claims, FAST))]);
+        const [plain, tagged] = await Promise.all([run(shell, script), run(shell, job.command, job.env)]);
         assert.deepEqual(tagged, plain, script);
         assert.ok(Date.now() - started < 4000, `the guard does not hold the command up: ${script}`);
+        assert.ok(await until(() => existsSync(join(job.claim, "pid")), 3000), `a guard was really running beside: ${script}`);
       }
     });
   }
 });
 
-test("the guard claims its id for its shell, stops its own process group when told, and nothing else", { skip: !posix }, async (t) => {
+test("the guard makes its claim for its shell, stops its own process group when told, and nothing else", { skip: !posix }, async (t) => {
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
-      const tag = randomUUID();
       // A child that ignores SIGTERM, and a last command the shell replaces itself with.
-      const job = start(shell, addTag("(trap '' TERM; sleep 60) &\nsleep 60", tag, claims, FAST));
+      const job = guarded("(trap '' TERM; sleep 60) &\nsleep 60");
+      const main = start(shell, job.command, job.env);
       const bystander = start(shell, "sleep 60");
       try {
-        assert.ok(await until(async () => (await io.readClaim(tag)) === String(job.pid)), `claim: ${await io.readClaim(tag)}`);
-        assert.ok((await group(job.pid)).length >= 3, "the command, its child and the guard share one group");
-        assert.equal(io.alive(job.pid), true);
+        assert.ok(await until(async () => (await io.readClaim(job.claim)) === String(main.pid)), `claim: ${await io.readClaim(job.claim)}`);
+        assert.ok((await group(main.pid)).length >= 3, "the command, its child and the guard share one group");
+        assert.equal(io.alive(main.pid), true);
 
-        await io.requestStop(tag);
-        const end = await job.exited;
+        await io.requestStop(job.claim);
+        const end = await main.exited;
         assert.ok(end.signal === "SIGTERM" || end.code === 143, `the command got SIGTERM: ${JSON.stringify(end)}`);
-        assert.ok(await until(async () => (await group(job.pid)).length === 0), "SIGKILL took the child that ignored SIGTERM, and the guard itself");
-        assert.equal(io.alive(job.pid), false);
+        assert.ok(await until(async () => (await group(main.pid)).length === 0), "SIGKILL took the child that ignored SIGTERM, and the guard itself");
+        assert.equal(io.alive(main.pid), false);
         assert.equal(io.alive(bystander.pid), true, "another command is not touched");
       } finally {
-        for (const pid of [job.pid, bystander.pid]) {
-          try {
-            process.kill(-pid, "SIGKILL");
-          } catch {
-            // already gone
-          }
-        }
+        killGroups(main.pid, bystander.pid);
       }
     });
   }
 });
 
-test("a shell that does not lead a process group of its own gets no guard", { skip: !posix }, async (t) => {
+test("the text of a command can be copied anywhere: without the launch's environment it starts no guard", { skip: !posix }, async (t) => {
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
-      const tag = randomUUID();
-      // Not detached: the shell stays in the group of this test process, which a guard must never stop.
-      const child = spawn(shell, ["-c", addTag("sleep 3", tag, claims, FAST)], { stdio: "ignore" });
-      const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      assert.equal(await io.readClaim(tag), null, "nothing was claimed");
-      await assert.rejects(io.requestStop(tag), { code: "ENOENT" }, "so nothing can be told to stop");
-      assert.deepEqual(await exited, { code: 0, signal: null }, "the command runs to its end");
+      const job = guarded("sleep 60");
+      const first = start(shell, job.command, job.env);
+      assert.ok(await until(async () => (await io.readClaim(job.claim)) === String(first.pid)));
+      // The very same text again, id and all: as a command of its own, inside another command, and
+      // even with the environment of the first launch handed over on purpose.
+      const copy = start(shell, job.command);
+      const nested = start(shell, `sleep 60 &\n${shell} -c '${job.command.replace(/'/g, `'\\''`)}'`);
+      const replay = start(shell, job.command, job.env);
+      try {
+        await pause(1500);
+        assert.equal(await io.readClaim(job.claim), String(first.pid), "the claim stays with the first");
+
+        await io.requestStop(job.claim);
+        await first.exited;
+        await pause(2500);
+        assert.equal(io.alive(copy.pid), true, "the copy is not stopped");
+        assert.equal(io.alive(nested.pid), true, "nor is the command that ran the text in a nested shell");
+        assert.equal(io.alive(replay.pid), true, "nor one that was given the same claim: it can be made once");
+      } finally {
+        killGroups(first.pid, copy.pid, nested.pid, replay.pid);
+      }
     });
   }
 });
 
-test("an id can be claimed once: the same text run again has no guard that could be told anything", { skip: !posix }, async (t) => {
+test("no guard where it could not be sure of its group: a shell that leads none, or job control", { skip: !posix }, async (t) => {
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
-      const tag = randomUUID();
-      const text = addTag("sleep 60", tag, claims, FAST);
-      const first = start(shell, text);
-      assert.ok(await until(async () => (await io.readClaim(tag)) === String(first.pid)));
-      // The very same text again, id and all: as a command of its own, and inside another command.
-      const copy = start(shell, text);
-      const nested = start(shell, `sleep 60 &\n${shell} -c '${text.replace(/'/g, `'\\''`)}'`);
-      try {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        assert.equal(await io.readClaim(tag), String(first.pid), "the claim stays with the first");
+      // Not detached: the shell stays in the group of this test process, which a guard must never stop.
+      const job = guarded("sleep 3");
+      const inside = start(shell, job.command, job.env, false);
+      await pause(1500);
+      assert.equal(await io.readClaim(job.claim), null, "nothing was claimed");
+      await assert.rejects(io.requestStop(job.claim), { code: "ENOENT" }, "so nothing can be told to stop");
+      assert.deepEqual(await inside.exited, { code: 0, signal: null }, "the command runs to its end");
 
-        await io.requestStop(tag);
-        await first.exited;
-        await new Promise((resolve) => setTimeout(resolve, 2500));
-        assert.equal(io.alive(copy.pid), true, "the copy is not stopped");
-        assert.equal(io.alive(nested.pid), true, "nor is the command that ran the text in a nested shell");
+      // Job control puts every background job into a group of its own: the guard would not be in the
+      // command's group, and gives up.
+      const monitored = guarded("set -m 2>/dev/null; sleep 3");
+      const withJobs = start(shell, `set -m 2>/dev/null\n${monitored.command.split("\n").slice(1).join("\n")}`, monitored.env);
+      await pause(1500);
+      const claimed = await io.readClaim(monitored.claim);
+      const groupOfGuard = claimed === null ? [] : await group(withJobs.pid);
+      // Either no claim at all, or (a shell without job control) a guard that really is in the group.
+      assert.ok(claimed === null || groupOfGuard.length >= 2, `claim ${claimed}, group ${groupOfGuard}`);
+      await withJobs.exited;
+    });
+  }
+});
+
+test("the guard does not depend on the user's shell setup: aliases, functions, PATH", { skip: !posix }, async (t) => {
+  // Startup files that redefine everything the guard line could be thought to use.
+  const home = await mkdtemp(join(dir, "home-"));
+  const traps = [
+    "alias mkdir='mkdir -p'",
+    "alias sh='echo not-a-shell'",
+    "alias unset='true'",
+    "alias kill='true'",
+    "mkdir() { command mkdir -p \"$@\"; }",
+    "sleep() { return 1; }",
+    "kill() { return 0; }",
+    "ps() { echo 1; }",
+  ].join("\n");
+  await writeFile(join(home, ".zshenv"), `${traps}\nalias -g TERM=KILL\n`);
+  await writeFile(join(home, "bash_env"), `shopt -s expand_aliases\n${traps}\nexport -f mkdir sleep kill ps\n`);
+  await mkdir(join(home, "bin"));
+  for (const tool of ["mkdir", "sleep", "ps", "tr"]) {
+    await writeFile(join(home, "bin", tool), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  }
+  const hostile = { ZDOTDIR: home, BASH_ENV: join(home, "bash_env"), ENV: join(home, "bash_env"), PATH: `${join(home, "bin")}:${process.env.PATH}` };
+
+  for (const shell of SHELLS) {
+    await t.test(shell, async () => {
+      const job = guarded("/bin/sleep 60", hostile);
+      const first = start(shell, job.command, job.env);
+      const replay = start(shell, job.command, job.env);
+      try {
+        assert.ok(await until(async () => (await io.readClaim(job.claim)) !== null), "the guard started all the same");
+        await pause(1200);
+        const owner = Number(await io.readClaim(job.claim));
+        assert.ok(owner === first.pid || owner === replay.pid);
+        const [winner, loser] = owner === first.pid ? [first, replay] : [replay, first];
+        await io.requestStop(job.claim);
+        await winner.exited;
+        assert.ok(await until(async () => (await group(winner.pid)).length === 0), "the group of the claim's owner is stopped");
+        await pause(1500);
+        assert.equal(io.alive(loser.pid), true, "the claim was made once, whatever mkdir is said to be");
       } finally {
-        for (const pid of [first.pid, copy.pid, nested.pid]) {
-          try {
-            process.kill(-pid, "SIGKILL");
-          } catch {
-            // already gone
-          }
-        }
+        killGroups(first.pid, replay.pid);
       }
     });
   }
@@ -182,67 +249,64 @@ test("the guard leaves with its command, and when its claim is removed", { skip:
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
       // The command ends: the guard notices that its shell is gone.
-      const short = randomUUID();
-      const job = start(shell, addTag("sleep 1", short, claims, FAST));
-      assert.deepEqual(await job.exited, { code: 0, signal: null });
-      assert.ok(await until(async () => (await group(job.pid)).length === 0), "nothing of the group is left");
-      assert.equal(await io.readClaim(short), String(job.pid), "the claim stays until the watchdog removes it");
+      const short = guarded("sleep 1");
+      const quick = start(shell, short.command, short.env);
+      assert.deepEqual(await quick.exited, { code: 0, signal: null });
+      assert.ok(await until(async () => (await group(quick.pid)).length === 0), "nothing of the group is left");
+      assert.equal(await io.readClaim(short.claim), String(quick.pid), "the claim stays until the watchdog removes it");
 
       // The command goes on, but is not watched any more: without its claim the guard leaves.
-      const tag = randomUUID();
-      const long = start(shell, addTag("sleep 60", tag, claims, FAST));
+      const job = guarded("sleep 60");
+      const long = start(shell, job.command, job.env);
       try {
-        assert.ok(await until(async () => (await io.readClaim(tag)) === String(long.pid)));
+        assert.ok(await until(async () => (await io.readClaim(job.claim)) === String(long.pid)));
         const size = (await group(long.pid)).length;
-        await io.dropClaim(tag);
+        await io.dropClaim(job.claim);
         assert.ok(await until(async () => (await group(long.pid)).length < size), "the guard is gone");
         assert.equal(io.alive(long.pid), true, "the command is not");
         // A stop for a claim that does not exist cannot even be written.
-        await assert.rejects(io.requestStop(tag), { code: "ENOENT" });
+        await assert.rejects(io.requestStop(job.claim), { code: "ENOENT" });
       } finally {
-        try {
-          process.kill(-long.pid, "SIGKILL");
-        } catch {
-          // already gone
-        }
+        killGroups(long.pid);
       }
     });
   }
 });
 
-test("claims: read, stop, take back, drop, sweep", async () => {
+test("claims: a part of the directory for every server; read, stop, take back, drop, sweep", async () => {
   assert.equal(defaultClaims({ XDG_STATE_HOME: "/x/state" }), join("/x/state", "opencode-shell-watchdog", "claims"));
   assert.match(defaultClaims({}), /\.local[\\/]state[\\/]opencode-shell-watchdog[\\/]claims$/);
-  assert.equal(await createIO({ claims: "/tmp/with\na line break" }).prepareClaims(), null);
   await writeFile(join(dir, "a-file"), "");
-  assert.equal(await createIO({ claims: join(dir, "a-file", "below a file") }).prepareClaims(), null);
+  assert.equal(await createIO({ claims: join(dir, "a-file", "below a file") }).prepareClaims("server"), null);
 
-  const tag = randomUUID();
-  assert.equal(await io.readClaim(tag), null, "nobody has claimed it");
-  await assert.rejects(io.requestStop(tag), { code: "ENOENT" });
-  await run("/bin/sh", `mkdir '${claims.replace(/'/g, `'\\''`)}/${tag}' && echo 4242 > '${claims.replace(/'/g, `'\\''`)}/${tag}/pid'`);
-  assert.equal(await io.readClaim(tag), "4242");
-  await io.requestStop(tag);
-  await io.requestStop(tag); // asking twice is asking once
-  assert.equal(existsSync(join(claims, tag, "stop")), true);
-  await io.cancelStop(tag);
-  await io.cancelStop(tag);
-  assert.equal(existsSync(join(claims, tag, "stop")), false);
+  const claim = join(space, randomUUID());
+  assert.equal(await io.readClaim(claim), null, "nobody has made it");
+  await assert.rejects(io.requestStop(claim), { code: "ENOENT" });
+  await mkdir(claim);
+  await writeFile(join(claim, "pid"), "4242\n");
+  assert.equal(await io.readClaim(claim), "4242");
+  await io.requestStop(claim);
+  await io.requestStop(claim); // asking twice is asking once
+  assert.equal(existsSync(join(claim, "stop")), true);
+  await io.cancelStop(claim);
+  await io.cancelStop(claim);
+  assert.equal(existsSync(join(claim, "stop")), false);
+  await io.dropClaim(claim);
+  await io.dropClaim(claim);
+  assert.equal(await io.readClaim(claim), null);
 
-  // Old claims of commands nobody watches go; fresh ones and those still in use stay.
-  const [old, kept, fresh] = [randomUUID(), randomUUID(), randomUUID()];
-  for (const name of [old, kept, fresh]) await run("/bin/sh", `mkdir '${claims.replace(/'/g, `'\\''`)}/${name}'`);
-  const longAgo = new Date(Date.now() - 3 * 24 * 60 * 60_000);
-  await utimes(join(claims, old), longAgo, longAgo);
-  await utimes(join(claims, kept), longAgo, longAgo);
-  await io.sweepClaims(new Set([kept]), 24 * 60 * 60_000);
-  const left = await readdir(claims);
-  assert.deepEqual([left.includes(old), left.includes(kept), left.includes(fresh), left.includes(tag)], [false, true, true, true]);
-
-  await io.dropClaim(tag);
-  await io.dropClaim(tag);
-  assert.equal(await io.readClaim(tag), null);
-  await createIO({ claims: join(dir, "no such directory") }).sweepClaims(new Set(), 0);
+  // The parts of servers that are long gone are removed; this server's own and recent ones stay.
+  const base = join(space, "..");
+  const old = await io.prepareClaims("server-old");
+  const recent = await io.prepareClaims("server-recent");
+  await mkdir(join(old, randomUUID()));
+  const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60_000);
+  await utimes(old, longAgo, longAgo);
+  await utimes(space, longAgo, longAgo);
+  await io.sweepClaims("server-1", 7 * 24 * 60 * 60_000);
+  assert.deepEqual((await readdir(base)).sort(), ["server-1", "server-recent"]);
+  assert.ok(existsSync(recent));
+  await createIO({ claims: join(dir, "no such directory") }).sweepClaims("x", 0);
 });
 
 test("output files: size, identity and a slice of bytes", async () => {
@@ -260,5 +324,5 @@ test("output files: size, identity and a slice of bytes", async () => {
   io.log({ kind: "test" });
   assert.ok(await until(() => existsSync(join(dir, "logs", "watchdog.log"))), "the log directory is created on demand");
   assert.match(await readFile(join(dir, "logs", "watchdog.log"), "utf8"), /"kind":"test"/);
-  createIO({ claims }).log({ kind: "nowhere" });
+  createIO({ claims: join(dir, "elsewhere") }).log({ kind: "nowhere" });
 });

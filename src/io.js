@@ -5,7 +5,7 @@ import { appendFile, mkdir, open, readFile, readdir, rm, stat, writeFile } from 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-/** Where guards claim their ids: a directory only its owner can enter. */
+/** Where guards claim their ids: a directory only its owner can enter, with one part per server. */
 export function defaultClaims(env = process.env) {
   const state = env.XDG_STATE_HOME || join(homedir(), ".local", "state");
   return join(state, "opencode-shell-watchdog", "claims");
@@ -13,11 +13,10 @@ export function defaultClaims(env = process.env) {
 
 /**
  * log: path of a JSON-lines log file, or "" for none.
- * claims: the claims directory (tests use their own).
+ * claims: the directory under which every server keeps the claims of its own guards.
  */
 export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
   let logReady;
-  const claim = (tag) => join(claims, tag);
 
   return {
     platform: process.platform,
@@ -51,46 +50,21 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
     },
 
     /**
-     * Makes the claims directory. Returns its path for the guard lines, or null when it cannot be
-     * used: then no command gets a kill limit. A path with a line break could not be put in a line.
+     * Makes this server's own part of the claims directory. Returns its path, or null when it cannot
+     * be used: then no command gets a kill limit.
      */
-    async prepareClaims() {
-      if (/[\r\n]/.test(claims)) return null;
+    async prepareClaims(space) {
+      const dir = join(claims, space);
       try {
-        await mkdir(claims, { recursive: true, mode: 0o700 });
-        return claims;
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        return dir;
       } catch {
         return null;
       }
     },
 
-    /** The pid a guard wrote when it claimed the id, as text; null when nobody has claimed it (yet). */
-    async readClaim(tag) {
-      try {
-        return (await readFile(join(claim(tag), "pid"), "utf8")).trim();
-      } catch (error) {
-        if (error?.code === "ENOENT") return null;
-        throw error;
-      }
-    },
-
-    /** Tells the guard that has claimed the id to stop its command. Fails when there is no claim. */
-    async requestStop(tag) {
-      await writeFile(join(claim(tag), "stop"), "");
-    },
-
-    /** Takes a stop back, in case the guard has not seen it yet. */
-    async cancelStop(tag) {
-      await rm(join(claim(tag), "stop"), { force: true });
-    },
-
-    /** Removes a claim that is not needed any more; its guard, if still there, leaves. */
-    async dropClaim(tag) {
-      await rm(claim(tag), { recursive: true, force: true });
-    },
-
-    /** Removes claims nobody can use any more: older than maxAge and not in `keep`. */
-    async sweepClaims(keep, maxAge) {
+    /** Removes the parts of servers that are long gone: untouched for maxAge, and not `space`. */
+    async sweepClaims(space, maxAge) {
       let names;
       try {
         names = await readdir(claims);
@@ -98,14 +72,39 @@ export function createIO({ log: logFile = "", claims = defaultClaims() } = {}) {
         return;
       }
       for (const name of names) {
-        if (keep.has(name)) continue;
+        if (name === space) continue;
         try {
-          const info = await stat(claim(name));
-          if (Date.now() - info.mtimeMs > maxAge) await rm(claim(name), { recursive: true, force: true });
+          const info = await stat(join(claims, name));
+          if (Date.now() - info.mtimeMs > maxAge) await rm(join(claims, name), { recursive: true, force: true });
         } catch {
           // Gone meanwhile, or not ours to remove.
         }
       }
+    },
+
+    /** The pid a guard wrote when it made the claim, as text; null when nobody has made it (yet). */
+    async readClaim(claim) {
+      try {
+        return (await readFile(join(claim, "pid"), "utf8")).trim();
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    },
+
+    /** Tells the guard that made the claim to stop its command. Fails when the claim does not exist. */
+    async requestStop(claim) {
+      await writeFile(join(claim, "stop"), "");
+    },
+
+    /** Takes a stop back, in case the guard has not seen it yet. */
+    async cancelStop(claim) {
+      await rm(join(claim, "stop"), { force: true });
+    },
+
+    /** Removes a claim that is not needed any more; its guard, if still there, leaves. */
+    async dropClaim(claim) {
+      await rm(claim, { recursive: true, force: true });
     },
 
     log(entry) {

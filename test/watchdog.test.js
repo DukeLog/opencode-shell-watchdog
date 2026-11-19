@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addTag, parseOptions, splitTag } from "../src/core.js";
-import { addInstance, beforeCreate, createState, handleEvent, liveTags, ownerOf, removeInstance, takeLines, tick, toolCall } from "../src/watchdog.js";
+import { CLAIM_ENV, addTag, guardLine, parseOptions, splitTag } from "../src/core.js";
+import { addInstance, beforeCreate, createState, handleEvent, ownerOf, removeInstance, takeLines, tick, toolCall } from "../src/watchdog.js";
 
 const MIN = 60_000;
 const TICK = 30_000;
 const CLAIMS = "/claims";
 const FIRST_TAG = "0a1b2c3d-1111-2222-3333-000000000001";
+const FIRST_CLAIM = `${CLAIMS}/${FIRST_TAG}`;
 const KILL_COMMAND = "# watchdog: kill-silence=2m silence=off\n./job.sh";
 
 function deferred() {
@@ -25,8 +26,8 @@ function world() {
     wall: 1_700_000_000_000,
     files: new Map(),
     alive: new Set(),
-    claims: new Map(), // tag -> { pid, stop }: what guards have claimed, and whether they were told to stop
-    stops: [], // tags of the guards that were told to stop, in order
+    claims: new Map(), // claim -> { pid, stop }: the claims guards have made, and whether they were told to stop
+    stops: [], // the claims whose guards were told to stop, in order
     cancelled: [],
     dropped: [],
     logs: [],
@@ -34,6 +35,7 @@ function world() {
     statGate: null,
     readGate: null,
     stopGate: null,
+    cancelGate: null,
     getGate: null,
     readFails: false,
     claimFails: false,
@@ -69,29 +71,34 @@ function world() {
       return w.files.get(file).data.subarray(start, start + length);
     },
     alive: (pid) => w.alive.has(pid),
-    async readClaim(tag) {
+    async readClaim(claim) {
       if (w.claimFails) throw Object.assign(new Error("cannot read"), { code: "EACCES" });
-      return w.claims.get(tag)?.pid ?? null;
+      return w.claims.get(claim)?.pid ?? null;
     },
-    async requestStop(tag) {
+    async requestStop(claim) {
       if (w.stopGate) {
         const gate = w.stopGate;
         w.stopGate = null;
         await gate.promise;
       }
       if (w.stopFails) throw Object.assign(new Error("cannot write"), { code: "EIO" });
-      const claim = w.claims.get(tag);
-      if (!claim) throw Object.assign(new Error("no such claim"), { code: "ENOENT" });
-      claim.stop = true;
-      w.stops.push(tag);
+      const made = w.claims.get(claim);
+      if (!made) throw Object.assign(new Error("no such claim"), { code: "ENOENT" });
+      made.stop = true;
+      w.stops.push(claim);
     },
-    async cancelStop(tag) {
-      if (w.claims.has(tag)) w.claims.get(tag).stop = false;
-      w.cancelled.push(tag);
+    async cancelStop(claim) {
+      if (w.cancelGate) {
+        const gate = w.cancelGate;
+        w.cancelGate = null;
+        await gate.promise;
+      }
+      if (w.claims.has(claim)) w.claims.get(claim).stop = false;
+      w.cancelled.push(claim);
     },
-    async dropClaim(tag) {
-      w.claims.delete(tag);
-      w.dropped.push(tag);
+    async dropClaim(claim) {
+      w.claims.delete(claim);
+      w.dropped.push(claim);
     },
     log: (entry) => void w.logs.push(entry),
   };
@@ -126,19 +133,19 @@ function world() {
 
   /**
    * A shell command is started, the way OpenCode does it: hook first, then the process, then the
-   * event. A command that was given a guard has its id claimed by then, as the real guard does in
-   * its first statement (guard: false leaves that out).
+   * event. A command that was given a guard has its claim made by then, as the real guard does when
+   * it starts (guard: false leaves that out). The claim is what the hook put into the environment.
    */
   w.shell = (id, { sessionID = "ses_1", pid, dir = "/a", command = "./job.sh", shell = "/bin/zsh", guard = true } = {}) => {
     const file = `/out/${id}`;
     w.files.set(file, { ino: pid, data: Buffer.alloc(0) });
     w.alive.add(pid);
     // The hook runs in the instance of the command's location only.
-    const event = { command, shell };
+    const event = { command, shell, env: { PATH: "/usr/bin:/bin" } };
     const owner = ownerOf(w.state, { dir, workspace: null });
     if (owner) beforeCreate(w.state, w.io, owner, event, w.newTag);
-    const { tag } = splitTag(event.command);
-    if (tag && guard && !w.claims.has(tag)) w.claims.set(tag, { pid: String(pid), stop: false });
+    const claim = event.env[CLAIM_ENV];
+    if (claim && guard && !w.claims.has(claim)) w.claims.set(claim, { pid: String(pid), stop: false });
     w.created(id, { sessionID, pid, dir, command: event.command, shell, file });
     return file;
   };
@@ -388,7 +395,7 @@ test("a read that fails after a good stat is not silence, and the bytes are read
   await w.run(a, MIN);
   assert.deepEqual(w.stops, [], "silence is counted from the moment the file was readable again");
   await w.run(a, MIN);
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
 });
 
 test("an observation is dropped when the owner goes away while the output is being read", async () => {
@@ -461,7 +468,7 @@ test("output that arrived but could not be taken in is not silence: no kill, no 
   await w.run(a, MIN);
   assert.deepEqual(w.stops, []);
   await w.run(a, MIN);
-  assert.deepEqual(w.stops, [FIRST_TAG], "two minutes after the output, not before");
+  assert.deepEqual(w.stops, [FIRST_CLAIM], "two minutes after the output, not before");
 });
 
 test("reading output: partial lines wait, a replaced file is read again, a flood is sampled", async () => {
@@ -604,7 +611,7 @@ test("a message never exceeds its size limit, however many commands and notices 
 
 // --- Automatic kill ----------------------------------------------------------------------------------
 //
-// The watchdog signals nothing. A command with a kill limit runs a guard that has claimed an id; the
+// The watchdog signals nothing. A command with a kill limit runs a guard that has made a claim; the
 // watchdog tells that guard to stop the command, and the guard stops its own process group. What the
 // guard itself does is checked against real shells in io.test.js.
 
@@ -612,7 +619,7 @@ test("kill: a command launched with a limit gets a guard, which is told to stop 
   const { w, a } = await started();
   w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
   const rec = w.state.shells.get("sh_1");
-  assert.equal(rec.tag, FIRST_TAG);
+  assert.deepEqual([rec.tag, rec.claim], [FIRST_TAG, FIRST_CLAIM]);
   assert.equal(rec.command, KILL_COMMAND, "the record keeps the command as it was given");
   assert.equal(rec.settings.killSilence, 2 * MIN);
   assert.equal(rec.bound, false, "no limit is in force before the guard was seen");
@@ -623,29 +630,40 @@ test("kill: a command launched with a limit gets a guard, which is told to stop 
   await w.run(a, MIN);
   assert.deepEqual(w.stops, []);
   await w.run(a, TICK);
-  assert.deepEqual(w.stops, [FIRST_TAG], "the guard that claimed the id of this launch, and nobody else");
+  assert.deepEqual(w.stops, [FIRST_CLAIM], "the guard that made the claim of this launch, and nobody else");
   assert.equal(a.sent.length, 1);
   assert.match(a.sent[0].text, /sh_1 is being stopped by the watchdog: no output for 2m, limit kill-silence=2m\. Its process group gets SIGTERM/);
   assert.match(await toolCall(w.state, w.io, a, { id: "sh_1" }, "ses_1"), /told to stop by the watchdog/);
 
-  // The guard does its work, the command ends; its claim is cleared away.
+  // The guard does its work, the command ends; a minute later its claim is cleared away.
   w.exit("sh_1", 100);
   await w.run(a, TICK);
-  assert.deepEqual(w.stops, [FIRST_TAG], "asked once");
-  assert.deepEqual(w.dropped, [FIRST_TAG]);
+  assert.deepEqual(w.dropped, [], "not at once: a stop that was just asked for must still be found");
+  await w.run(a, MIN);
+  assert.deepEqual(w.dropped, [FIRST_CLAIM]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM], "asked once");
   assert.equal(a.sent.length, 1);
 });
 
-test("kill: the command as it is launched carries the id and the guard line in front, nothing else changes", async () => {
+test("kill: what a launch with a limit gets: two lines in front of the command, and the claim in its environment", async () => {
   const { w, a } = await started();
-  const event = { command: KILL_COMMAND, shell: "/bin/zsh" };
+  const event = { command: KILL_COMMAND, shell: "/bin/zsh", env: { PATH: "/bin", [CLAIM_ENV]: "/somebody/else" } };
   beforeCreate(w.state, w.io, a, event, w.newTag);
-  const lines = event.command.split("\n");
-  assert.equal(lines[0], `# shell-watchdog:${FIRST_TAG}`);
-  assert.match(lines[1], /^\( \( trap '' TERM; d='\/claims\/0a1b2c3d-1111-2222-3333-000000000001'; kill -0 "-\$\$" 2>\/dev\/null && mkdir "\$d" .* & \) # shell-watchdog guard$/);
-  assert.equal(lines.slice(2).join("\n"), KILL_COMMAND);
-  assert.equal(event.command, addTag(KILL_COMMAND, FIRST_TAG, CLAIMS));
+  assert.equal(event.command, `# shell-watchdog:${FIRST_TAG}\n${guardLine()}\n${KILL_COMMAND}`);
+  assert.equal(event.command, addTag(KILL_COMMAND, FIRST_TAG));
   assert.deepEqual(splitTag(event.command), { tag: FIRST_TAG, command: KILL_COMMAND });
+  assert.deepEqual(event.env, { PATH: "/bin", [CLAIM_ENV]: FIRST_CLAIM }, "the claim of this launch, not one that came in");
+  assert.doesNotMatch(event.command, /claims/, "the text says nothing about where the claim is");
+
+  // A launch without a limit gets nothing, and loses a claim that came in with its environment.
+  const plain = { command: "./job.sh", shell: "/bin/zsh", env: { PATH: "/bin", [CLAIM_ENV]: FIRST_CLAIM } };
+  beforeCreate(w.state, w.io, a, plain, w.newTag);
+  assert.deepEqual(plain, { command: "./job.sh", shell: "/bin/zsh", env: { PATH: "/bin" } });
+
+  // Without an environment to put the claim into, there is no guard.
+  const bare = { command: KILL_COMMAND, shell: "/bin/zsh" };
+  beforeCreate(w.state, w.io, a, bare, w.newTag);
+  assert.deepEqual(bare, { command: KILL_COMMAND, shell: "/bin/zsh" });
 });
 
 test("kill: a limit by runtime, and limits changed through the tool", async () => {
@@ -657,7 +675,7 @@ test("kill: a limit by runtime, and limits changed through the tool", async () =
   await w.run(a, 2.5 * MIN, () => w.print("sh_1", `step ${n++}\n`));
   assert.deepEqual(w.stops, []);
   await w.run(a, TICK, () => w.print("sh_1", `step ${n++}\n`));
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
   assert.match(a.sent[0].text, /ran for 5m, limit kill-runtime=5m/);
 });
 
@@ -671,11 +689,11 @@ test("kill: the session is told when a command that was told to stop is still ru
   assert.match(a.sent[1].text, /sh_1 was told to stop 30s ago and is still running \(pid 100\)\. The watchdog does nothing more about it/);
   await w.run(a, 20 * MIN);
   assert.equal(a.sent.length, 2, "said once");
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
 });
 
-test("a kill limit comes into force only when the guard of this very shell has claimed the id", async () => {
-  // The guard never started (its line failed, or was killed at once).
+test("a kill limit comes into force only when the guard of this very shell has made the claim", async () => {
+  // The guard never started (it found itself outside the command's group, or was killed at once).
   const none = await started();
   none.w.shell("sh_1", { pid: 100, command: KILL_COMMAND, guard: false });
   await none.w.run(none.a, TICK);
@@ -683,19 +701,19 @@ test("a kill limit comes into force only when the guard of this very shell has c
   await none.w.run(none.a, TICK);
   assert.match(none.a.sent[0].text, /sh_1: automatic kill is off for this command, because its guard did not start/);
   const rec = none.w.state.shells.get("sh_1");
-  assert.deepEqual([rec.tag, rec.bound, rec.settings.killSilence], [null, false, 0]);
+  assert.deepEqual([rec.tag, rec.claim, rec.bound, rec.settings.killSilence], [null, null, false, 0]);
   assert.deepEqual(rec.notes, ["kill limits (its guard did not start)"]);
-  // Somebody claims the id later: too late, nothing is ever asked of it.
-  none.w.claims.set(FIRST_TAG, { pid: "100", stop: false });
+  // Somebody makes the claim later: too late, nothing is ever asked of it.
+  none.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
   await none.w.run(none.a, 10 * MIN);
   assert.deepEqual(none.w.stops, []);
 
-  // The id is held by a guard of another shell (the same text was running somewhere else first).
+  // The claim was made by the guard of another shell.
   const other = await started();
-  other.w.claims.set(FIRST_TAG, { pid: "4242", stop: false });
+  other.w.claims.set(FIRST_CLAIM, { pid: "4242", stop: false });
   other.w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
   await other.w.run(other.a, TICK);
-  assert.match(other.a.sent[0].text, /automatic kill is off for this command, because its id was claimed by another process/);
+  assert.match(other.a.sent[0].text, /automatic kill is off for this command, because its claim was made by another process/);
   await other.w.run(other.a, 10 * MIN);
   assert.deepEqual(other.w.stops, [], "the other guard is never told to stop anything");
 
@@ -703,9 +721,9 @@ test("a kill limit comes into force only when the guard of this very shell has c
   const slow = await started();
   slow.w.shell("sh_1", { pid: 100, command: KILL_COMMAND, guard: false });
   await slow.w.run(slow.a, TICK);
-  slow.w.claims.set(FIRST_TAG, { pid: "100", stop: false });
+  slow.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
   await slow.w.run(slow.a, 1.5 * MIN);
-  assert.deepEqual(slow.w.stops, [FIRST_TAG]);
+  assert.deepEqual(slow.w.stops, [FIRST_CLAIM]);
 
   // A claims directory that cannot be read counts as a guard that did not start.
   const unreadable = await started();
@@ -741,7 +759,7 @@ test("kill: when the stop cannot be requested, the session is told and the limit
   assert.match(gone.a.sent[0].text, /NOT stopped: the stop could not be requested \(ENOENT\)/);
 });
 
-/** A command at its kill limit, with the pass that tells its guard to stop held up in the write. */
+/** A command at its kill limit, with the write that tells its guard to stop held up. */
 async function atKillLimit(extraLocation) {
   const w = world();
   const a = w.instance("/a");
@@ -758,53 +776,78 @@ async function atKillLimit(extraLocation) {
   const release = async () => {
     gate.resolve();
     await running;
+    await settle();
   };
   return { w, a, owner, release };
 }
 
-test("kill: goes ahead when nothing changed while the stop was being requested", async () => {
+test("kill: the decision is recorded before the stop is written, and carried out once", async () => {
   const { w, a, release } = await atKillLimit();
+  const rec = w.state.shells.get("sh_1");
+  assert.equal(rec.killed.written, false, "decided, not yet done");
   await release();
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
   assert.deepEqual(w.cancelled, []);
+  assert.equal(rec.killed.written, true);
   assert.equal(a.sent.length, 1);
 });
 
-test("kill: a stop is taken back when the limit, the command or the owner changed while it was being requested", async () => {
-  // The agent switches the limit off.
+test("kill: the stop file ends up saying what the record says, whoever writes last", async () => {
+  // The agent switches the limit off while the stop is being written: it is taken back afterwards.
   const off = await atKillLimit();
-  await toolCall(off.w.state, off.w.io, off.a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  assert.match(await toolCall(off.w.state, off.w.io, off.a, { id: "sh_1", killSilence: "off" }, "ses_1"), /The stop that was asked for is taken back/);
   await off.release();
-  assert.deepEqual(off.w.cancelled, [FIRST_TAG]);
-  assert.equal(off.w.claims.get(FIRST_TAG).stop, false);
+  assert.equal(off.w.claims.get(FIRST_CLAIM).stop, false, "written, then removed: in that order");
   assert.equal(off.w.state.shells.get("sh_1").killed, null);
-  assert.equal(off.a.sent.length, 0);
+  assert.equal(off.a.sent.length, 0, "nothing was done, nothing is said");
   await off.w.run(off.a, 10 * MIN);
-  assert.deepEqual(off.w.stops, [FIRST_TAG], "and it is not requested again");
+  assert.equal(off.w.claims.get(FIRST_CLAIM).stop, false, "and it is not asked for again");
 
-  // The command ends by itself.
-  const ended = await atKillLimit();
-  ended.w.exit("sh_1", 100);
-  await ended.release();
-  assert.deepEqual(ended.w.cancelled, [FIRST_TAG]);
-  assert.equal(ended.a.sent.length, 0);
+  // The pass that asked lost its lease meanwhile; the limit was switched off under the next lease.
+  const stale = await atKillLimit();
+  stale.w.advance(10 * MIN);
+  const next = tick(stale.w.state, stale.w.io, stale.a);
+  await settle();
+  await toolCall(stale.w.state, stale.w.io, stale.a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  await stale.release();
+  await next;
+  await settle();
+  assert.equal(stale.w.claims.get(FIRST_CLAIM).stop, false, "the late writer leaves no stop behind");
+  assert.equal(stale.w.state.shells.get("sh_1").killed, null);
 
-  // The instance of its location is unloaded.
-  const orphan = await atKillLimit("/b");
-  removeInstance(orphan.w.state, orphan.owner);
-  await orphan.release();
-  assert.deepEqual(orphan.w.cancelled, [FIRST_TAG]);
-  assert.equal(orphan.w.state.shells.get("sh_1").killed, null);
-  assert.equal(orphan.w.state.notices.size, 0);
-
-  // The record was replaced.
-  const replaced = await atKillLimit();
-  replaced.w.state.shells.set("sh_1", { ...replaced.w.state.shells.get("sh_1") });
-  await replaced.release();
-  assert.deepEqual(replaced.w.cancelled, [FIRST_TAG]);
+  // A stop is taken back, the taking back is held up, and meanwhile another limit fires: the two are
+  // carried out in the order they were asked for, so the new stop is what remains.
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  await w.run(a, 2 * MIN);
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, true);
+  w.cancelGate = deferred();
+  const gate = w.cancelGate;
+  await toolCall(w.state, w.io, a, { id: "sh_1", killSilence: "off" }, "ses_1");
+  await toolCall(w.state, w.io, a, { id: "sh_1", killRuntime: "1m" }, "ses_1");
+  w.advance(TICK);
+  const pass = tick(w.state, w.io, a);
+  await settle();
+  assert.notEqual(w.state.shells.get("sh_1").killed, null, "the runtime limit has fired");
+  gate.resolve();
+  await pass;
+  await settle();
+  assert.deepEqual(w.cancelled, [FIRST_CLAIM]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM, FIRST_CLAIM], "written, taken back, written again");
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, true, "the late cancellation did not remove the new stop");
 });
 
-test("kill: a pass that lost its lease takes its stop back; the pass that replaced it decides anew", async () => {
+test("kill: a command that ends while its stop is being written", async () => {
+  const { w, a, release } = await atKillLimit();
+  w.exit("sh_1", 100);
+  await release();
+  assert.equal(a.sent.length, 0, "no notice about a command that is over");
+  assert.equal(w.state.notices.size, 0);
+  await w.run(a, 2 * MIN);
+  assert.deepEqual(w.dropped, [FIRST_CLAIM]);
+});
+
+test("kill: a pass that lost its lease still finishes what it decided, and the next pass does not decide again", async () => {
   const { w, a, release } = await atKillLimit();
   const stale = w.state.lock;
   w.advance(10 * MIN); // stuck long enough for the lease to be taken over
@@ -813,23 +856,22 @@ test("kill: a pass that lost its lease takes its stop back; the pass that replac
   assert.notEqual(w.state.lock, stale);
   await release();
   await next;
-  assert.deepEqual(w.cancelled, [], "a pass without its lease touches nothing, not even its own request");
-  assert.equal(w.claims.get(FIRST_TAG).stop, true);
-  assert.equal(w.stops.length, 2, "the later pass asked as well; asking twice is asking once");
-  assert.equal(w.state.shells.get("sh_1").killed !== null, true);
-  assert.equal(a.sent.length, 1, "one notice");
+  assert.deepEqual(w.stops, [FIRST_CLAIM], "one request");
+  assert.equal(w.state.shells.get("sh_1").killed.written, true);
+  await w.run(a, TICK);
+  assert.equal(a.sent.filter((message) => /is being stopped/.test(message.text)).length, 1, "one notice");
   assert.equal(w.state.lock, null);
 });
 
 test("an id is taken only from this plugin's own hook, and only once", async () => {
   const { w, a } = await started();
   // Somebody pastes a command that already carries tag lines, e.g. copied from the list of commands.
-  const pasted = addTag(KILL_COMMAND, "ffffffff-1111-2222-3333-444444444444", CLAIMS);
+  const pasted = addTag(KILL_COMMAND, "ffffffff-1111-2222-3333-444444444444");
   w.shell("sh_1", { pid: 100, command: pasted });
   const first = w.state.shells.get("sh_1");
   assert.equal(first.tag, FIRST_TAG, "the pasted id was replaced by a fresh one");
   assert.equal(first.command, KILL_COMMAND);
-  assert.equal(w.claims.has("ffffffff-1111-2222-3333-444444444444"), false);
+  assert.deepEqual([...w.claims.keys()], [FIRST_CLAIM]);
 
   // The same text started again is a different command with a different id.
   w.shell("sh_2", { pid: 200, command: pasted });
@@ -838,30 +880,30 @@ test("an id is taken only from this plugin's own hook, and only once", async () 
   // An id that reaches the registry without having been issued (the hook did not run) is ignored.
   w.created("sh_3", { pid: 300, command: pasted });
   const forged = w.state.shells.get("sh_3");
-  assert.equal(forged.tag, null);
+  assert.deepEqual([forged.tag, forged.claim], [null, null]);
   assert.deepEqual([forged.settings.killSilence, forged.settings.killRuntime], [0, 0]);
   assert.deepEqual(forged.notes, ["kill limits (the id in the command was not issued for this launch)"]);
 
   // An issued id is good for one command only.
-  w.created("sh_4", { pid: 400, command: addTag(KILL_COMMAND, first.tag, CLAIMS) });
+  w.created("sh_4", { pid: 400, command: addTag(KILL_COMMAND, first.tag) });
   assert.equal(w.state.shells.get("sh_4").tag, null);
 
   await w.run(a, 10 * MIN);
-  assert.deepEqual(w.stops.sort(), [first.tag, w.state.shells.get("sh_2").tag].sort(), "only the two guards of the two real launches");
+  assert.deepEqual(w.stops.sort(), [first.claim, w.state.shells.get("sh_2").claim].sort(), "only the two guards of the two real launches");
 });
 
 test("commands without a kill limit are started exactly as they were given", async () => {
   const { w, a } = await started();
   for (const command of ["./job.sh", "# watchdog: report=5m\n./job.sh", "# watchdog: off kill-runtime=1h\n./job.sh"]) {
-    const event = { command, shell: "/bin/zsh" };
+    const event = { command, shell: "/bin/zsh", env: {} };
     beforeCreate(w.state, w.io, a, event, w.newTag);
-    assert.equal(event.command, command);
+    assert.deepEqual(event, { command, shell: "/bin/zsh", env: {} });
   }
   assert.equal(w.state.issued.size, 0);
 
   // Tag lines that come with a command are removed even when it gets none of its own.
   const unlimited = "# watchdog: kill-silence=off silence=off\n./job.sh";
-  const event = { command: addTag(unlimited, FIRST_TAG, CLAIMS), shell: "/bin/zsh" };
+  const event = { command: addTag(unlimited, FIRST_TAG), shell: "/bin/zsh", env: {} };
   beforeCreate(w.state, w.io, a, event, w.newTag);
   assert.equal(event.command, unlimited);
   assert.equal(w.state.issued.size, 0);
@@ -891,27 +933,28 @@ test("kill limits exist only for commands with a guard; the tool cannot add one 
   assert.deepEqual(bare.state.shells.get("sh_1").notes, ["kill limits (the state directory of the watchdog cannot be used)"]);
 });
 
-test("the claim of a guard is removed when its command is not watched any more", async () => {
+test("the claim of a guard is removed a while after its command is not watched any more", async () => {
   const { w, a } = await started();
   w.session("ses_2");
   w.shell("sh_1", { pid: 100, command: KILL_COMMAND }); // ends
   w.shell("sh_2", { pid: 200, command: KILL_COMMAND }); // the agent stops watching it
   w.shell("sh_3", { pid: 300, command: KILL_COMMAND, sessionID: "ses_2" }); // its session is deleted
   w.shell("sh_4", { pid: 400, command: KILL_COMMAND, guard: false }); // its guard never starts
-  w.shell("sh_5", { pid: 500, command: KILL_COMMAND }); // stays
-  const tags = ["sh_1", "sh_2", "sh_3", "sh_4", "sh_5"].map((id) => w.state.shells.get(id).tag);
-  assert.deepEqual([...liveTags(w.state)].sort(), [...tags].sort());
+  w.shell("sh_5", { pid: 500, command: "# watchdog: kill-silence=1h silence=off\n./job.sh" }); // stays
+  const claims = ["sh_1", "sh_2", "sh_3", "sh_4", "sh_5"].map((id) => w.state.shells.get(id).claim);
 
   w.exit("sh_1", 100);
   assert.match(await toolCall(w.state, w.io, a, { id: "sh_2", off: true }, "ses_1"), /Stopped watching sh_2/);
   handleEvent(w.state, w.io, { type: "session.deleted", data: { sessionID: "ses_2" } });
+  await w.run(a, TICK);
+  assert.deepEqual(w.dropped, [], "kept for a minute");
   await w.run(a, 1.5 * MIN);
-  assert.deepEqual(w.dropped.sort(), tags.slice(0, 4).sort());
-  assert.deepEqual([...liveTags(w.state)], [tags[4]]);
-  assert.equal(w.state.obsolete.size, 0);
+  assert.deepEqual(w.dropped.sort(), claims.slice(0, 4).sort());
+  assert.deepEqual([...w.claims.keys()], [claims[4]]);
+  assert.equal(w.state.obsolete.size + w.state.ops.size, 0);
 
   // Ids that were issued but never became a command do not pile up.
-  for (let i = 0; i < 1200; i++) beforeCreate(w.state, w.io, a, { command: KILL_COMMAND, shell: "/bin/zsh" }, w.newTag);
+  for (let i = 0; i < 1200; i++) beforeCreate(w.state, w.io, a, { command: KILL_COMMAND, shell: "/bin/zsh", env: {} }, w.newTag);
   assert.equal(w.state.issued.size, 1000);
   await w.run(a, 11 * MIN);
   assert.equal(w.state.issued.size, 0);
@@ -921,8 +964,10 @@ test("tool: stopping to watch a command that was already told to stop", async ()
   const { w, a } = await started();
   w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
   await w.run(a, 2 * MIN);
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
   assert.match(await toolCall(w.state, w.io, a, { id: "sh_1", off: true }, "ses_1"), /Stopped watching sh_1.* The stop it was already told to make goes ahead\./);
+  await w.run(a, TICK);
+  assert.equal(w.claims.get(FIRST_CLAIM).stop, true, "the stop is left for its guard");
 });
 
 // --- Events late, lost, repeated ---------------------------------------------------------------------
@@ -984,22 +1029,23 @@ test("an event that arrives late is not watched, but still ends the old command 
   assert.equal(w.state.pending.size, 0);
 });
 
-test("a late event of an older launch gets its guard told to stop, and that guard is gone with its command", async () => {
+test("a late event of a launch whose pid has gone to another command: the stop reaches only the old guard's claim", async () => {
   // A was launched with a limit; its event is held up. A ends, its pid goes to B, which is not
   // watched, so nothing tells the watchdog. Then A's event arrives.
   const { w, a } = await started();
-  const first = { command: KILL_COMMAND, shell: "/bin/zsh" };
+  const first = { command: KILL_COMMAND, shell: "/bin/zsh", env: {} };
   beforeCreate(w.state, w.io, a, first, w.newTag);
-  w.claims.set(FIRST_TAG, { pid: "100", stop: false }); // A's guard claimed the id when A started
+  w.claims.set(FIRST_CLAIM, { pid: "100", stop: false }); // A's guard made the claim when A started
   const firstStart = w.wall;
   w.advance(20_000);
   w.alive.add(100); // the pid is B's now
   w.files.set("/out/sh_a", { ino: 100, data: Buffer.alloc(0) });
   w.created("sh_a", { pid: 100, command: first.command, started: firstStart });
   await w.run(a, 3 * MIN);
-  // The limit of A "fires", and the request goes to the one guard that ever held A's id: a process
-  // of A's own group, which left when A ended. B is not involved, whatever its command line says.
-  assert.deepEqual(w.stops, [FIRST_TAG]);
+  // The limit of A "fires", and the request goes into the claim that only A's guard could make: the
+  // path was in the environment of A's launch and nowhere else. That guard was a process of A's own
+  // group and left when A ended. B, whatever its command line says, has no part in it.
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
 });
 
 // --- Generations -------------------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 // world goes through `io`, so the whole thing can be driven by tests.
 
 import {
+  CLAIM_ENV,
   DAY,
   KILL_SETTINGS,
   absorb,
@@ -39,7 +40,7 @@ import {
 
 // Bump the number when the shape of the state changes: a reloaded plugin must not inherit a state
 // it does not understand.
-const KEY = Symbol.for("opencode-shell-watchdog/state-6");
+const KEY = Symbol.for("opencode-shell-watchdog/state-7");
 
 const MAX_READ = 256 * 1024;
 const MAX_LINE = 64 * 1024;
@@ -53,6 +54,7 @@ const STALE_EVENT = 5 * 60_000;
 const ISSUED_TTL = 10 * 60_000;
 const ISSUED_CAP = 1000;
 const CLAIM_TRIES = 2;
+const CLAIM_LINGER = 60_000;
 const STOP_PATIENCE = 30_000;
 const DEFAULT_TICK = 30_000;
 
@@ -61,8 +63,10 @@ export function createState() {
     shells: new Map(), // id -> record of a watched command
     pending: new Map(), // id -> { raw, at }: commands of a location without a live instance
     done: new Map(), // id -> obs: commands that are over, so a late event cannot revive them
-    issued: new Map(), // tag -> obs: ids of guards this plugin wrote into commands being launched
-    obsolete: new Set(), // tags whose claims are of no use any more and can be removed
+    space: null, // name of this server's own part of the claims directory
+    issued: new Map(), // tag -> { at, claim }: ids of guards given to commands that are being launched
+    obsolete: new Map(), // claim -> obs: claims that are of no use any more and will be removed
+    ops: new Map(), // claim -> promise: the last operation on the files of a claim, one at a time
     notices: new Map(), // sessionID -> [{ text, at, dir, workspace }]: what happened to kill limits
     sessions: new Map(), // sessionID -> { wakes, sentWall, sentObs, missing }
     instances: new Set(),
@@ -76,13 +80,6 @@ export function sharedState() {
   return (globalThis[KEY] ??= createState());
 }
 
-/** The ids of guards that are still of use: of watched commands and of commands being launched. */
-export function liveTags(state) {
-  const tags = new Set(state.issued.keys());
-  for (const rec of state.shells.values()) if (rec.tag) tags.add(rec.tag);
-  for (const { raw } of state.pending.values()) if (raw.tag) tags.add(raw.tag);
-  return tags;
-}
 
 // ---------------------------------------------------------------------------------------------
 // Instances and ownership
@@ -102,7 +99,7 @@ export function addInstance(state, io, inst) {
     if (!sameLocation(inst, entry.raw)) continue;
     state.pending.delete(id);
     if (io.alive(entry.raw.pid)) activate(state, io, inst, entry.raw);
-    else onGone(state, id, entry.raw.tag);
+    else onGone(state, id, entry.raw.claim);
   }
 }
 
@@ -129,19 +126,23 @@ function log(state, io, target, entry) {
 }
 
 /**
- * The `create.before` hook: a command launched with a kill limit gets a guard with an id of its own
- * (see addTag in core.js). Tag lines that came with the command are dropped first, whatever happens
- * next: an id is never taken from input.
+ * The `create.before` hook: a command launched with a kill limit gets a guard, and the guard gets the
+ * path of its claim through the environment of this one launch (see core.js). Whatever came in is
+ * cleared first, in the text and in the environment: an id is never taken from input.
  */
 export function beforeCreate(state, io, inst, event, newTag) {
   if (inst.disposed || typeof event?.command !== "string") return;
+  const env = event.env && typeof event.env === "object" ? event.env : null;
+  if (env) delete env[CLAIM_ENV];
   const command = stripTags(event.command);
   if (command !== event.command) event.command = command;
-  if (!inst.claims || !wantsTag(command, event.shell, inst.settings, io.platform)) return;
+  if (!inst.claims || !env || !wantsTag(command, event.shell, inst.settings, io.platform)) return;
   const tag = String(newTag()).toLowerCase();
-  state.issued.set(tag, state.obs);
+  const claim = `${inst.claims}/${tag}`;
+  state.issued.set(tag, { at: state.obs, claim });
   if (state.issued.size > ISSUED_CAP) state.issued.delete(state.issued.keys().next().value);
-  event.command = addTag(command, tag, inst.claims);
+  env[CLAIM_ENV] = claim;
+  event.command = addTag(command, tag);
 }
 
 export function handleEvent(state, io, event) {
@@ -179,7 +180,8 @@ function onCreated(state, io, info, location) {
 
   // The id of a guard counts once, and only if this plugin wrote it into this launch.
   const split = splitTag(info.command);
-  const issued = split.tag !== null && state.issued.delete(split.tag);
+  const issued = split.tag === null ? undefined : state.issued.get(split.tag);
+  if (issued) state.issued.delete(split.tag);
   const raw = {
     id,
     sessionID,
@@ -187,6 +189,7 @@ function onCreated(state, io, info, location) {
     file: info.file,
     command: stripTags(info.command),
     tag: issued ? split.tag : null,
+    claim: issued ? issued.claim : null,
     foreignTag: split.tag !== null && !issued,
     shell: String(info.shell ?? ""),
     cwd: info.cwd,
@@ -201,9 +204,9 @@ function onCreated(state, io, info, location) {
 }
 
 function activate(state, io, inst, raw) {
-  if (inst.options.ignore.some((pattern) => pattern.test(raw.command))) return onGone(state, raw.id, raw.tag);
+  if (inst.options.ignore.some((pattern) => pattern.test(raw.command))) return onGone(state, raw.id, raw.claim);
   const directive = parseDirective(raw.command, raw.shell);
-  if (directive.off) return onGone(state, raw.id, raw.tag);
+  if (directive.off) return onGone(state, raw.id, raw.claim);
   const { settings, notes } = resolveSettings(inst.settings, directive);
   if (killArmed(settings) && !raw.tag) {
     for (const key of KILL_SETTINGS) settings[key] = 0;
@@ -237,10 +240,10 @@ function release(state, io, pid) {
 }
 
 /** Forgets a command. The claim of its guard, if it had one, is of no use any more. */
-function onGone(state, id, tag = null) {
+function onGone(state, id, claim = null) {
   if (typeof id !== "string") return;
   const known = state.shells.get(id) ?? state.pending.get(id)?.raw;
-  for (const obsolete of [tag, known?.tag]) if (obsolete) state.obsolete.add(obsolete);
+  for (const obsolete of [claim, known?.claim]) if (obsolete && !state.obsolete.has(obsolete)) state.obsolete.set(obsolete, state.obs);
   state.shells.delete(id);
   state.pending.delete(id);
   bury(state, id);
@@ -299,11 +302,15 @@ export async function tick(state, io, inst) {
 
 function sweep({ state, io }) {
   for (const [id, at] of state.done) if (state.obs - at > TOMBSTONE_TTL) state.done.delete(id);
-  for (const [tag, at] of state.issued) if (state.obs - at > ISSUED_TTL) state.issued.delete(tag);
+  for (const [tag, issued] of state.issued) if (state.obs - issued.at > ISSUED_TTL) state.issued.delete(tag);
   for (const [id, entry] of state.pending) if (state.obs - entry.at > PENDING_TTL) onGone(state, id);
   // Claims of commands that are not watched any more: with the claim gone, the guard leaves too.
-  for (const tag of state.obsolete) void Promise.resolve(io.dropClaim(tag)).catch(() => {});
-  state.obsolete.clear();
+  // They stay for a while, so that a stop that was just asked for is still found by its guard.
+  for (const [claim, at] of state.obsolete) {
+    if (state.obs - at < CLAIM_LINGER) continue;
+    state.obsolete.delete(claim);
+    void serial(state, claim, () => io.dropClaim(claim)).catch(() => {});
+  }
   for (const [sessionID, list] of state.notices) {
     const fresh = list.filter((notice) => state.obs - notice.at <= NOTICE_TTL);
     if (fresh.length) state.notices.set(sessionID, fresh);
@@ -414,8 +421,9 @@ function disarm(rec) {
 /** Takes the kill limits from a command for good, and says so if it had any. */
 function unbind(state, rec, why) {
   const armed = killArmed(rec.settings);
-  state.obsolete.add(rec.tag);
+  if (rec.claim && !state.obsolete.has(rec.claim)) state.obsolete.set(rec.claim, state.obs);
   rec.tag = null;
+  rec.claim = null;
   rec.bound = false;
   disarm(rec);
   if (!armed) return;
@@ -424,9 +432,9 @@ function unbind(state, rec, why) {
 }
 
 /**
- * A kill limit comes into force when the guard of the command is seen to have claimed the id that was
- * issued for it, for the very shell the command runs in. An id claimed by anything else, or by nobody
- * within two passes, is never used.
+ * A kill limit comes into force when the guard of the command is seen to have made the claim that was
+ * prepared for it, for the very shell the command runs in. A claim made by anything else, or by
+ * nobody within two passes, is never used.
  */
 async function bind({ state, io, held }) {
   for (const rec of [...state.shells.values()]) {
@@ -434,17 +442,48 @@ async function bind({ state, io, held }) {
     if (!waiting()) continue;
     let claimed;
     try {
-      claimed = await io.readClaim(rec.tag);
+      claimed = await io.readClaim(rec.claim);
     } catch {
       claimed = null;
     }
     if (!held()) return;
     if (!waiting()) continue;
     if (claimed === String(rec.pid)) rec.bound = true;
-    else if (claimed) unbind(state, rec, "its id was claimed by another process");
+    else if (claimed) unbind(state, rec, "its claim was made by another process");
     else if (++rec.claimTries >= CLAIM_TRIES) unbind(state, rec, "its guard did not start");
     if (!rec.tag) log(state, io, rec, { kind: "kill-off", id: rec.id, pid: rec.pid, claimed });
   }
+}
+
+/** Runs the operations on the files of one claim one after another, whoever asks for them. */
+function serial(state, claim, operation) {
+  const before = state.ops.get(claim) ?? Promise.resolve();
+  const next = before.then(operation, operation);
+  const settled = next.then(
+    () => {},
+    () => {},
+  );
+  state.ops.set(claim, settled);
+  void settled.then(() => {
+    if (state.ops.get(claim) === settled) state.ops.delete(claim);
+  });
+  return next;
+}
+
+/**
+ * Makes the stop file of a claim say what the record says at the moment the operation runs: there if
+ * the command is to be stopped, not there otherwise. Because it looks at the record when it runs, and
+ * runs after everything asked before it, it does not matter who asked, in which order, or how late.
+ * Resolves to true when a stop is in place.
+ */
+function settleStop(state, io, claim) {
+  return serial(state, claim, async () => {
+    let wanted = false;
+    for (const rec of state.shells.values()) if (rec.claim === claim && rec.killed) wanted = true;
+    if (wanted) await io.requestStop(claim);
+    else await io.cancelStop(claim);
+    return wanted;
+  });
 }
 
 /**
@@ -457,7 +496,7 @@ async function enforce({ state, io, held }) {
     if (state.shells.get(rec.id) !== rec || !ownerOf(state, rec)) continue;
     if (rec.killed) {
       const waited = rec.clock - rec.killed.at;
-      if (!rec.killed.reported && waited >= STOP_PATIENCE) {
+      if (rec.killed.written && !rec.killed.reported && waited >= STOP_PATIENCE) {
         rec.killed.reported = true;
         notify(state, rec, stillRunningNotice(rec, waited));
         log(state, io, rec, { kind: "still-running", id: rec.id, pid: rec.pid });
@@ -466,31 +505,27 @@ async function enforce({ state, io, held }) {
     }
     const reason = killReason(rec);
     if (!reason) continue;
-    // Nothing is awaited between the checks above and the request below.
-    const tag = rec.tag;
-    const rev = rec.rev;
+    // The decision is made and recorded here, under the lease, with nothing awaited since the checks
+    // above. What follows only carries it out, and belongs to this decision alone: if the record has
+    // moved on by the time the file is written (the limit switched off, the command gone), the file
+    // is settled according to the record as it then is, and nothing else is touched.
+    const decision = { setting: reason.setting, text: reason.text, at: rec.clock, written: false, reported: false };
+    rec.killed = decision;
     let failure = null;
     try {
-      await io.requestStop(tag);
+      await settleStop(state, io, rec.claim);
     } catch (error) {
       failure = `the stop could not be requested (${errorCode(error)})`;
     }
-    // A pass that lost its lease does nothing more, not even take its request back: the pass that
-    // replaced it decides about the command, and asking twice is the same as asking once.
-    if (!held()) return;
-    if (state.shells.get(rec.id) !== rec || rec.rev !== rev || !ownerOf(state, rec)) {
-      // The limit was changed, or the command went away, while the request was being written: take
-      // the request back if the guard has not picked it up yet.
-      if (!failure) void Promise.resolve(io.cancelStop(tag)).catch(() => {});
-      continue;
-    }
+    if (state.shells.get(rec.id) !== rec || rec.killed !== decision) continue;
     if (failure) {
+      rec.killed = null;
       disarm(rec);
       notify(state, rec, killRefusedNotice(rec, reason, failure));
       log(state, io, rec, { kind: "kill-refused", id: rec.id, pid: rec.pid, why: failure });
       continue;
     }
-    rec.killed = { setting: reason.setting, text: reason.text, at: rec.clock, reported: false };
+    decision.written = true;
     notify(state, rec, killNotice(rec, reason));
     log(state, io, rec, { kind: "kill", id: rec.id, pid: rec.pid, why: reason.text });
   }
@@ -680,10 +715,17 @@ export async function toolCall(state, io, inst, input, sessionID) {
     return `Stopped watching ${id}: no more reports and no automatic kill for it.${stopping}`;
   }
   if (Object.keys(patch).length) applySettings(own, patch);
+  // Switching off the limit that fired takes the stop back, if its guard has not acted on it yet.
+  let withdrawn = "";
+  if (own.killed && patch[own.killed.setting] === 0) {
+    own.killed = null;
+    void settleStop(state, io, own.claim).catch(() => {});
+    withdrawn = "\nThe stop that was asked for is taken back; if the guard of the command has already seen it, the command is being stopped all the same.";
+  }
   if (snooze !== undefined) {
     own.checkAt = snooze > 0 ? own.clock + snooze : 0;
     own.rev += 1;
   }
   log(state, io, own, { kind: "tool", id, patch, snooze });
-  return statusBlock(own, options);
+  return statusBlock(own, options) + withdrawn;
 }

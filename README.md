@@ -148,51 +148,64 @@ why, and told again if the command is still running half a minute after that.
 
 The watchdog itself never sends a signal. Telling from outside which process a pid belongs to cannot be
 done safely: pids are given out again, and whatever a process table says is old by the time it is read.
-So a command launched with a kill limit is started with two extra lines in front of it:
+So a command launched with a kill limit is started with two extra lines in front of it and one extra
+variable in its environment:
 
 ```sh
-# shell-watchdog:3f6c1a52-…                   <- a random id, new for every launch
-( ( … ) & ) # shell-watchdog guard            <- starts the guard
+# shell-watchdog:3f6c1a52-…                          <- a random id, new for every launch
+( '/bin/sh' '-c' '…' … & ); … # shell-watchdog guard  <- starts the guard
 # watchdog: kill-silence=30m
 ./flaky-download.sh
 ```
 
-The second line starts a *guard*: a small shell loop that lives in the command's own process group.
+The second line starts a *guard*: a small loop in a plain `/bin/sh` that lives in the command's own
+process group.
 
-1. The guard claims the id by creating a directory named after it. Only the first to try can, so the
-   same text run a second time, or inside another command, has no guard.
-2. The watchdog checks that the claim was made by the shell of this very command. Only then is the
+1. The guard finds the path of its *claim* in the environment of the launch. The text of a command
+   can be copied and run again anywhere; the environment of one launch cannot. The line removes the
+   variable from the command's shell at once, so the command and its children never see it.
+2. The guard goes on only if it is a member of the process group led by the command's shell. (Not so
+   under job control, or when the shell leads no group: then there is no guard and no limit.)
+3. It makes the claim by creating a directory, which only the first to try can do.
+4. The watchdog checks that the claim was made for the shell of this very command. Only then is the
    limit in force.
-3. When the limit is reached, the watchdog creates one file in that directory. The guard sees it, and
-   sends `SIGTERM` and then `SIGKILL` to the process group led by its shell — the one it is in itself.
-   (A shell that does not lead a group of its own gets no guard in the first place.)
+5. When the limit is reached, the watchdog creates one file in that directory. The guard sees it, and
+   sends `SIGTERM` and then `SIGKILL` to the process group it is in.
 
-A guard can only ever stop the group it was started in, and that group cannot be given to anything else
-while the guard is in it. So nothing depends on pids being unique, on clocks, or on `ps`.
+As long as the guard lives, its group exists and the group's id cannot be given to anything else. So a
+guard can only ever stop the group it was started in, and nothing depends on pids being unique, on
+clocks, or on the order in which events arrive.
+
+Nor does the guard depend on your shell setup: every word of its line is quoted, so no alias applies;
+`/bin/sh` is called by its path; inside it the tools (`ps`, `mkdir`, `sleep`) are found on the system's
+default path, past any function of the same name.
 
 The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
 `jobs` and `$!` do not see it, and the exit status, output and traps of the command are what they were.
-It leaves when the command's shell is gone or the command is no longer watched.
+(One thing does change: the command's lines are numbered two higher, which shows in `$LINENO` and in
+the line numbers of shell error messages.) The guard leaves when the command's shell is gone or the
+command is no longer watched.
 
 What follows from that:
 
 - A kill limit cannot be added to a command that was launched without one. A limit given at launch can
-  be changed or switched off while the command runs (`watchdog({id, killSilence: "off"})`).
+  be changed or switched off while the command runs (`watchdog({id, killSilence: "off"})`). Switching
+  off the limit that has just fired takes the stop back, if the guard has not acted on it yet.
 - Commands without a kill limit are started exactly as they were written. (Tag lines that come with a
   command, say copied from the list of commands, are removed: an id is never taken from input.)
 - The two lines are visible wherever OpenCode shows the command, and the guard is visible in `ps` as a
-  second process with the command line of the shell. A `pkill -f` that matches that command line takes
-  the guard along, and with it the kill limit.
+  `/bin/sh -c …` process. A `pkill -f` that happens to match it takes the kill limit along.
 - A command that replaces its shell (`exec ./server`) keeps its limit: the guard goes by the pid.
-- If the guard cannot be tied to the command — it did not start, or the id was claimed by something
-  else — the limit is dropped and the session is told.
+- If the guard cannot be tied to the command — it did not start, or the claim was made for another
+  shell — the limit is dropped and the session is told.
 - Automatic kill needs settings that were understood completely. A typo, a missing value or the same
   key twice in the directive (or in the plugin options) switches automatic kill off for that command,
   and the first report says what was ignored.
 
-Needs macOS or Linux and one of `sh`, `bash`, `zsh`, `dash`, `ash` (the shells the guard is tested in).
-The claims are kept in `$XDG_STATE_HOME/opencode-shell-watchdog/claims`, by default under
-`~/.local/state`. Processes that left the command's process group (`setsid`, daemons) are not reached.
+Needs macOS or Linux, one of `sh`, `bash`, `zsh`, `dash`, `ash` as the shell of the command, and a
+`ps` that understands `-o pgid= -p <pid>` (procps, BSD; not BusyBox). The claims are kept in
+`$XDG_STATE_HOME/opencode-shell-watchdog/claims`, by default under `~/.local/state`, in a directory per
+server process. Processes that left the command's process group (`setsid`, daemons) are not reached.
 
 ## Time
 
