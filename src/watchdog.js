@@ -154,18 +154,19 @@ export function handleEvent(state, io, event) {
 function onCreated(state, io, info, location) {
   const id = info?.id;
   if (typeof id !== "string" || !Number.isInteger(info.pid) || info.pid <= 1) return;
-  if (info.status && info.status !== "running") return;
   if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
-  // An event about a start long ago is a replay. It says nothing about who has the pid today.
   const started = Number(info.time?.started);
-  if (Number.isFinite(started) && io.wall() - started > STALE_EVENT) return;
-  // A new command with this pid: whatever had the pid before is over, although its exit was never
-  // announced. Forget it before anything else is decided about the new command, watched or not, so
-  // that nothing of the old one can act on a process that merely carries a familiar command line.
-  release(state, io, id, info.pid);
+  // First of all, and whatever becomes of this command: its pid is not somebody else's any more.
+  release(state, io, info.pid, started);
 
+  // Not watched: no session to report to, already over, or an event about a start long ago (a replay,
+  // or one held up by a sleeping machine). The id is remembered all the same.
   const sessionID = info.metadata?.sessionID;
-  if (typeof sessionID !== "string" || typeof info.file !== "string" || typeof location?.directory !== "string") return;
+  const stale = Number.isFinite(started) && io.wall() - started > STALE_EVENT;
+  const running = !info.status || info.status === "running";
+  if (stale || !running || typeof sessionID !== "string" || typeof info.file !== "string" || typeof location?.directory !== "string") {
+    return void bury(state, id);
+  }
 
   // A tag counts once, and only if this plugin wrote it into this launch.
   const split = splitTag(info.command);
@@ -202,16 +203,26 @@ function activate(state, io, inst, raw) {
   (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
 }
 
-/** Drops everything that is still bound to a pid which now belongs to the new command `id`. */
-function release(state, io, id, pid) {
+/**
+ * A command that started at `started` has this pid. Whatever had the pid before that moment is over,
+ * although its exit was never announced: it is forgotten here, so that nothing of it can act on a
+ * process that merely carries a familiar command line. This holds however late the event arrives.
+ * What started later than the event (the event is a replay) is left alone.
+ */
+function release(state, io, pid, started) {
+  // Only an event that is known to be older than the owner is a replay. An unknown time, or the same
+  // one, ends the owner: losing a watch is the harmless mistake.
+  const before = (owner) => !(started < owner);
   for (const rec of [...state.shells.values()]) {
-    if (rec.pid !== pid || rec.id === id) continue;
-    log(state, io, rec, { kind: "pid-reused", id: rec.id, pid, by: id });
+    if (rec.pid !== pid || !before(rec.startedWall)) continue;
+    log(state, io, rec, { kind: "pid-reused", id: rec.id, pid });
     onGone(state, rec.id);
   }
-  for (const entry of [...state.pending.values()]) if (entry.raw.pid === pid && entry.raw.id !== id) onGone(state, entry.raw.id);
+  for (const { raw } of [...state.pending.values()]) if (raw.pid === pid && before(raw.startedWall)) onGone(state, raw.id);
   // A pid is not given out again while its process group has members: the old group is empty.
-  for (const entry of [...state.terminating.values()]) if (entry.pid === pid) state.terminating.delete(entry.id);
+  for (const entry of [...state.terminating.values()]) {
+    if (entry.pid === pid && before(entry.startedWall)) state.terminating.delete(entry.id);
+  }
 }
 
 function onGone(state, id) {
@@ -434,6 +445,7 @@ async function enforce({ state, io, held }) {
       workspace: rec.workspace,
       pid: rec.pid,
       tag: rec.tag,
+      startedWall: rec.startedWall,
       setting: reason.setting,
       termObs: state.obs,
       termWall: io.wall(),

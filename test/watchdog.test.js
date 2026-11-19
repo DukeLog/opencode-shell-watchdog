@@ -129,11 +129,11 @@ function world() {
   };
 
   /** The bare `shell.created` event, without hook and process. */
-  w.created = (id, { sessionID = "ses_1", pid, dir = "/a", command, shell = "/bin/zsh", file = `/out/${id}` }) => {
+  w.created = (id, { sessionID = "ses_1", pid, dir = "/a", command, shell = "/bin/zsh", file = `/out/${id}`, started = w.wall }) => {
     handleEvent(w.state, w.io, {
       type: "shell.created",
       location: { directory: dir },
-      data: { info: { id, status: "running", command, shell, file, pid, metadata: { sessionID }, time: { started: w.wall } } },
+      data: { info: { id, status: "running", command, shell, file, pid, metadata: { sessionID }, time: { started } } },
     });
   };
 
@@ -767,6 +767,63 @@ test("a pid that shows up in a new command ends everything the old command of th
   w.shell("sh_8", { pid: 700 });
   assert.equal(w.state.pending.size, 0);
   assert.deepEqual([...w.state.shells.keys()], ["sh_6", "sh_8"]);
+});
+
+test("an event that arrives late still ends the old command of its pid, and is not watched itself", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  const launched = addTag(KILL_COMMAND, FIRST_TAG);
+  await w.run(a, MIN);
+
+  // sh_1 ends without an exit event. Its pid goes to an unwatched command that execs the old text,
+  // and the event about that start is held up for six minutes (the machine slept).
+  const startedAt = w.wall;
+  w.argv.set(100, `/bin/sh -c ${launched.replace(/\n/g, "\\012")}`);
+  w.wall += 6 * MIN;
+  w.created("sh_2", { pid: 100, command: `# watchdog: off\nexec /bin/sh -c '${launched}'`, started: startedAt });
+  assert.equal(w.state.shells.size, 0, "the old record is gone, the late one is not registered");
+  assert.equal(w.state.done.has("sh_2"), true);
+  await w.run(a, 5 * MIN);
+  assert.deepEqual(w.signals, []);
+
+  // The same with a SIGKILL pending for the old group.
+  w.shell("sh_3", { pid: 300, command: KILL_COMMAND });
+  await w.run(a, 2 * MIN);
+  assert.deepEqual(w.signals, [[300, "SIGTERM"]]);
+  const restartedAt = w.wall;
+  w.wall += 6 * MIN;
+  w.created("sh_4", { pid: 300, command: "./next.sh", started: restartedAt });
+  assert.equal(w.state.terminating.size, 0);
+  await w.run(a, MIN);
+  assert.deepEqual(w.signals, [[300, "SIGTERM"]]);
+});
+
+test("an event about an earlier start of the same pid does not touch the command that has the pid now", async () => {
+  const { w, a } = await started();
+  // A had the pid first and was never watched (no session); then B got the pid.
+  const firstStart = w.wall;
+  w.created("sh_a", { pid: 100, sessionID: null, command: "./a.sh" });
+  assert.equal(w.state.done.has("sh_a"), true, "an unwatched id is remembered too");
+  w.wall += MIN;
+  w.shell("sh_b", { pid: 100, command: KILL_COMMAND });
+  w.processes.push({ pid: 101, pgid: 100, startedWall: w.wall });
+
+  // A's event comes again: as a duplicate, and as if it had never been seen.
+  w.created("sh_a", { pid: 100, sessionID: null, command: "./a.sh", started: firstStart });
+  w.state.done.delete("sh_a");
+  w.created("sh_a", { pid: 100, sessionID: null, command: "./a.sh", started: firstStart });
+  w.created("sh_c", { pid: 100, command: "./c.sh", started: firstStart - MIN });
+  assert.deepEqual([...w.state.shells.keys()], ["sh_b", "sh_c"], "B is still watched; C is only another record");
+
+  // B's pending SIGKILL survives such an event as well.
+  w.state.shells.delete("sh_c");
+  await w.run(a, 2 * MIN);
+  assert.deepEqual(w.signals, [[100, "SIGTERM"]]);
+  w.exit("sh_b", 100);
+  w.created("sh_d", { pid: 100, sessionID: null, command: "./d.sh", started: firstStart });
+  assert.equal(w.state.terminating.size, 1);
+  await w.run(a, TICK);
+  assert.deepEqual(w.signals, [[100, "SIGTERM"], [100, "SIGKILL"]]);
 });
 
 test("a replayed event about a start long ago neither revives a command nor takes a pid from a live one", async () => {
