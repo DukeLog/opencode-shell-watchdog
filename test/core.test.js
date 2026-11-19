@@ -25,6 +25,7 @@ import {
   reportBlock,
   resolveSettings,
   setObserve,
+  settingKey,
   shapeOf,
   shortCommand,
   splitLines,
@@ -81,7 +82,7 @@ test("duration formatting", () => {
 test("directive is read from the first line only", () => {
   const directive = parseDirective("# watchdog: report=5m silence=off\n./train.sh", "/bin/zsh");
   assert.equal(directive.found, true);
-  assert.deepEqual(directive.values, { report: "5m", silence: "off" });
+  assert.deepEqual(directive.pairs, [["report", "5m"], ["silence", "off"]]);
 
   assert.equal(parseDirective("./train.sh # watchdog: kill-runtime=1s", "/bin/zsh").found, false);
   assert.equal(parseDirective("echo '# watchdog: kill-runtime=1s'", "/bin/bash").found, false);
@@ -102,7 +103,7 @@ test("directive is applied only for shells where # starts a comment", () => {
 test("directive: off, separators and unreadable tokens", () => {
   assert.equal(parseDirective("# watchdog: off\nnpm run dev", "zsh").off, true);
   const directive = parseDirective("#watchdog: report=5m, Kill-Silence=30m nonsense loop= =5m", "bash");
-  assert.deepEqual(directive.values, { report: "5m", "Kill-Silence": "30m", loop: "" }, "a setting without a value is kept to be rejected by name");
+  assert.deepEqual(directive.pairs, [["report", "5m"], ["Kill-Silence", "30m"], ["loop", ""]], "a setting without a value is kept to be rejected by name");
   assert.deepEqual(directive.errors.map((error) => error.text), ['could not read "nonsense" (expected name=value)', 'could not read "=5m" (expected name=value)']);
 });
 
@@ -115,6 +116,12 @@ test("automatic kill needs settings that were understood completely", () => {
   assert.deepEqual(limits("report=5m"), [2 * 60 * MIN, 30 * MIN], "a clean directive leaves the defaults armed");
   assert.deepEqual(limits("kill-runtime=off"), [0, 30 * MIN], "the plain way to switch one off");
   assert.deepEqual(limits("kill-runtime=1h kill-silence=5m"), [60 * MIN, 5 * MIN]);
+  const good = resolveSettings(defaults, parseDirective("# watchdog: report=5m kill_silence=20m LOOP=shape\n./job.sh", "sh"));
+  assert.deepEqual(good.settings, { silence: 5 * MIN, loop: "shape", report: 5 * MIN, killSilence: 20 * MIN, killRuntime: 2 * 60 * MIN });
+  assert.deepEqual(good.notes, []);
+  const bad = resolveSettings(defaults, parseDirective("# watchdog: silence=nope report=2m\n./job.sh", "sh"));
+  assert.equal(bad.settings.silence, SETTING_DEFAULTS.silence, "a rejected value leaves the default of that setting");
+  assert.equal(bad.settings.report, 2 * MIN, "and the readable ones are applied");
 
   for (const broken of [
     "kill-runtime=", // empty value
@@ -129,11 +136,20 @@ test("automatic kill needs settings that were understood completely", () => {
     "reprot=5m", // a typo in something else
     "silence=nope",
     "nonsense",
+    // Names that a plain object would swallow or find on its prototype.
+    "__proto__=off",
+    "constructor=off",
+    "toString=1",
+    "hasOwnProperty=x",
   ]) {
     assert.deepEqual(limits(broken), [0, 0], broken);
+    const { notes } = resolveSettings(defaults, parseDirective(`# watchdog: ${broken}\n./job.sh`, "sh"));
+    assert.ok(notes.length >= 2, `${broken}: what was not understood, and that kill is off`);
   }
   const { notes } = resolveSettings(defaults, parseDirective("# watchdog: kill-runtime=\n./job.sh", "sh"));
-  assert.match(notes.join("; "), /kill-runtime needs a duration/);
+  assert.match(notes.join("; "), /kill-runtime needs a duration.*; automatic kill is off for this command/);
+  const harmless = resolveSettings(SETTING_DEFAULTS, parseDirective("# watchdog: reprot=5m\n./job.sh", "sh"));
+  assert.deepEqual(harmless.notes, ['unknown setting "reprot"'], "nothing to say about kill when none was asked for");
 
   // The same for the options of the plugin.
   const armed = (raw) => {
@@ -147,6 +163,15 @@ test("automatic kill needs settings that were understood completely", () => {
   assert.deepEqual(armed({ killRuntime: "1h", "kil-silence": "5m" }), [0, 0]);
   assert.deepEqual(armed({ killRuntime: "1h", tick: "never" }), [0, 0], "any option that was not understood");
   assert.match(parseOptions({ killRuntime: "off", "kill-runtime": "1s" }).errors.join("; "), /kill-runtime is given more than once/);
+  // Options arrive as parsed JSON, where "__proto__" is an ordinary key.
+  for (const json of ['{"killRuntime":"1s","__proto__":"off"}', '{"killRuntime":"1s","constructor":"off"}', '{"killRuntime":"1s","toString":1}']) {
+    const parsed = parseOptions(JSON.parse(json));
+    assert.deepEqual([parsed.settings.killRuntime, parsed.settings.killSilence], [0, 0], json);
+    assert.match(parsed.errors.join("; "), /unknown option/, json);
+  }
+  assert.equal(settingKey("constructor"), undefined);
+  assert.equal(settingKey("__proto__"), undefined);
+  assert.equal(settingKey("Kill_Run-Time"), "killRuntime");
 });
 
 test("plugin options", () => {
@@ -436,7 +461,7 @@ test("tag: two lines in front of the command, both removed again", () => {
   const tagged = addTag(command, TAG);
   assert.equal(tagged, `# shell-watchdog:${TAG}\ntrap : EXIT\n# watchdog: kill-runtime=2h\n./job.sh`);
   assert.deepEqual(splitTag(tagged), { tag: TAG, command });
-  assert.equal(parseDirective(splitTag(tagged).command, "/bin/zsh").values["kill-runtime"], "2h", "the directive is the first line again");
+  assert.deepEqual(parseDirective(splitTag(tagged).command, "/bin/zsh").pairs, [["kill-runtime", "2h"]], "the directive is the first line again");
   assert.deepEqual(splitTag(addTag("trap : EXIT\n./job.sh", TAG)), { tag: TAG, command: "trap : EXIT\n./job.sh" }, "a trap line of the command itself stays");
   assert.deepEqual(splitTag(`# shell-watchdog:${TAG.toUpperCase()}\n./job.sh`), { tag: TAG, command: "./job.sh" });
 

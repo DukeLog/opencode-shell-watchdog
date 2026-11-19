@@ -727,10 +727,62 @@ test("a relaunch of the old tagged text on a reused pid is never taken for the o
   w.shell("sh_2", { pid: 100, command: copied });
   assert.doesNotMatch(w.argv.get(100), /shell-watchdog/, "the old identity did not get into the new argv");
   assert.equal(w.state.shells.get("sh_2").tag, null);
+  assert.equal(w.state.shells.has("sh_1"), false, "and the old record went the moment its pid showed up again");
 
   await w.run(a, 3 * MIN);
-  assert.deepEqual(w.signals, [], "the old record cannot signal the new process");
-  assert.match(a.sent[0].text, /sh_1 reached its kill limit .* but was NOT killed: process 100 is not the command that was launched/);
+  assert.deepEqual(w.signals, [], "nothing of the old command can signal the new process");
+  assert.equal(a.sent.length, 0);
+});
+
+test("a pid that shows up in a new command ends everything the old command of that pid could do", async () => {
+  // The worst case: the old tag does get into the argv of the new process, through a nested shell.
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  const launched = addTag(KILL_COMMAND, FIRST_TAG);
+  // sh_1 ends without an exit event; its pid goes to an unwatched command that execs the old text.
+  w.shell("sh_2", { pid: 100, command: `# watchdog: off\nexec /bin/sh -c '${launched}'` });
+  w.argv.set(100, `/bin/sh -c ${launched.replace(/\n/g, "\\012")}`);
+  assert.equal(w.state.shells.size, 0, "sh_2 is not watched, and sh_1 is forgotten");
+  await w.run(a, 5 * MIN);
+  assert.deepEqual(w.signals, []);
+
+  // The same for a command without a session, which is never watched either.
+  w.shell("sh_3", { pid: 300, command: KILL_COMMAND });
+  w.shell("sh_4", { pid: 300, sessionID: null, command: "./anything.sh" });
+  assert.equal(w.state.shells.has("sh_3"), false);
+
+  // And for a pending SIGKILL: the group it was meant for is gone when its id is in use again.
+  w.shell("sh_5", { pid: 500, command: KILL_COMMAND });
+  await w.run(a, 2 * MIN);
+  assert.deepEqual(w.signals, [[500, "SIGTERM"]]);
+  assert.equal(w.state.terminating.size, 1);
+  w.shell("sh_6", { pid: 500, command: "./next.sh" });
+  assert.equal(w.state.terminating.size, 0);
+  await w.run(a, 2 * MIN);
+  assert.deepEqual(w.signals, [[500, "SIGTERM"]], "no SIGKILL for the group of the new command");
+
+  // A command waiting for its location's instance is dropped the same way.
+  w.shell("sh_7", { pid: 700, dir: "/elsewhere" });
+  assert.equal(w.state.pending.size, 1);
+  w.shell("sh_8", { pid: 700 });
+  assert.equal(w.state.pending.size, 0);
+  assert.deepEqual([...w.state.shells.keys()], ["sh_6", "sh_8"]);
+});
+
+test("a replayed event about a start long ago neither revives a command nor takes a pid from a live one", async () => {
+  const { w, a } = await started();
+  w.shell("sh_new", { pid: 100 });
+  const long = w.wall;
+  w.wall += 20 * MIN; // tombstones of that time have expired by now
+  handleEvent(w.state, w.io, {
+    type: "shell.created",
+    location: { directory: "/a" },
+    data: { info: { id: "sh_old", status: "running", command: "./old.sh", shell: "/bin/zsh", file: "/out/sh_old", pid: 100, metadata: { sessionID: "ses_1" }, time: { started: long - 60 * MIN } } },
+  });
+  assert.deepEqual([...w.state.shells.keys()], ["sh_new"]);
+  assert.equal(w.state.pending.size, 0);
+  await w.run(a, TICK);
+  assert.equal(w.state.shells.get("sh_new").missing, 0);
 });
 
 test("a tag further down in a command, or after a -c of its own, proves nothing", async () => {

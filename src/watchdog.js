@@ -52,6 +52,7 @@ const PENDING_TTL = 60 * 60_000;
 const PENDING_CAP = 500;
 const NOTICE_TTL = 60 * 60_000;
 const TERMINATING_TTL = 10 * 60_000;
+const STALE_EVENT = 5 * 60_000;
 const ISSUED_TTL = 10 * 60_000;
 const ISSUED_CAP = 1000;
 const DEFAULT_TICK = 30_000;
@@ -152,12 +153,19 @@ export function handleEvent(state, io, event) {
 
 function onCreated(state, io, info, location) {
   const id = info?.id;
-  const sessionID = info?.metadata?.sessionID;
-  if (typeof id !== "string" || typeof sessionID !== "string") return;
+  if (typeof id !== "string" || !Number.isInteger(info.pid) || info.pid <= 1) return;
   if (info.status && info.status !== "running") return;
-  if (!Number.isInteger(info.pid) || info.pid <= 1 || typeof info.file !== "string") return;
-  if (typeof location?.directory !== "string") return;
   if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
+  // An event about a start long ago is a replay. It says nothing about who has the pid today.
+  const started = Number(info.time?.started);
+  if (Number.isFinite(started) && io.wall() - started > STALE_EVENT) return;
+  // A new command with this pid: whatever had the pid before is over, although its exit was never
+  // announced. Forget it before anything else is decided about the new command, watched or not, so
+  // that nothing of the old one can act on a process that merely carries a familiar command line.
+  release(state, io, id, info.pid);
+
+  const sessionID = info.metadata?.sessionID;
+  if (typeof sessionID !== "string" || typeof info.file !== "string" || typeof location?.directory !== "string") return;
 
   // A tag counts once, and only if this plugin wrote it into this launch.
   const split = splitTag(info.command);
@@ -173,7 +181,7 @@ function onCreated(state, io, info, location) {
     cwd: info.cwd,
     dir: location.directory,
     workspace: location.workspaceID ?? null,
-    startedWall: Number(info.time?.started),
+    startedWall: started,
   };
   const owner = ownerOf(state, raw);
   if (owner) return activate(state, io, owner, raw);
@@ -192,6 +200,18 @@ function activate(state, io, inst, raw) {
   }
   state.shells.set(raw.id, createRecord(raw, settings, notes));
   (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
+}
+
+/** Drops everything that is still bound to a pid which now belongs to the new command `id`. */
+function release(state, io, id, pid) {
+  for (const rec of [...state.shells.values()]) {
+    if (rec.pid !== pid || rec.id === id) continue;
+    log(state, io, rec, { kind: "pid-reused", id: rec.id, pid, by: id });
+    onGone(state, rec.id);
+  }
+  for (const entry of [...state.pending.values()]) if (entry.raw.pid === pid && entry.raw.id !== id) onGone(state, entry.raw.id);
+  // A pid is not given out again while its process group has members: the old group is empty.
+  for (const entry of [...state.terminating.values()]) if (entry.pid === pid) state.terminating.delete(entry.id);
 }
 
 function onGone(state, id) {
@@ -608,12 +628,12 @@ export async function toolCall(state, io, inst, input, sessionID) {
 
   // The whole call is checked before any part of it is applied.
   const errors = [];
-  const settingInput = {};
+  const settingPairs = [];
   for (const key of given) {
     if (!TOOL_FIELDS.has(key)) errors.push(`unknown field "${key}"`);
-    else if (key !== "id" && key !== "off" && key !== "snooze") settingInput[key] = args[key];
+    else if (key !== "id" && key !== "off" && key !== "snooze") settingPairs.push([key, args[key]]);
   }
-  const parsed = parseSettings(settingInput);
+  const parsed = parseSettings(settingPairs);
   errors.push(...parsed.errors.map((error) => error.text));
   const { patch } = parsed;
   if (args.off !== undefined && args.off !== null && typeof args.off !== "boolean") errors.push("off must be true or false");

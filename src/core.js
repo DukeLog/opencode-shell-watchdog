@@ -81,13 +81,15 @@ const formatSetting = (ms) => (ms > 0 ? formatDuration(ms).replace(/ /g, "") : "
 // ---------------------------------------------------------------------------------------------
 // Settings
 
-const SETTING_KEYS = {
-  silence: "silence",
-  loop: "loop",
-  report: "report",
-  killsilence: "killSilence",
-  killruntime: "killRuntime",
-};
+// Maps and lists of pairs, not plain objects, wherever a name comes from outside: "constructor" must
+// not be found on a prototype, and "__proto__" must not vanish when it is stored.
+const SETTING_KEYS = new Map([
+  ["silence", "silence"],
+  ["loop", "loop"],
+  ["report", "report"],
+  ["killsilence", "killSilence"],
+  ["killruntime", "killRuntime"],
+]);
 const SETTING_LABELS = {
   silence: "silence",
   loop: "loop",
@@ -97,7 +99,7 @@ const SETTING_LABELS = {
 };
 
 export function settingKey(key) {
-  return SETTING_KEYS[String(key).toLowerCase().replace(/[-_\s]/g, "")];
+  return SETTING_KEYS.get(String(key).toLowerCase().replace(/[-_\s]/g, ""));
 }
 
 function parseLoop(value) {
@@ -110,14 +112,15 @@ function parseLoop(value) {
 }
 
 /**
- * Validates setting values. Returns { patch, errors }: canonical keys with parsed values, and one
- * { key, text } per rejected entry (key is undefined for an unknown name).
+ * Validates setting values, given as [name, value] pairs or as an object. Returns { patch, errors }:
+ * canonical keys with parsed values, and one { key, text } per rejected entry (key is undefined for
+ * an unknown name).
  */
 export function parseSettings(input) {
   const patch = {};
   const errors = [];
   const seen = new Set();
-  for (const [rawKey, rawValue] of Object.entries(input ?? {})) {
+  for (const [rawKey, rawValue] of Array.isArray(input) ? input : Object.entries(input ?? {})) {
     if (rawValue === undefined) continue;
     const key = settingKey(rawKey);
     if (!key) {
@@ -151,11 +154,15 @@ function disarm(settings) {
 
 /** Settings of one command: defaults overlaid with its directive. */
 export function resolveSettings(defaults, directive) {
-  const { patch, errors } = parseSettings(directive?.values);
+  const { patch, errors } = parseSettings(directive?.pairs ?? []);
   const all = [...(directive?.errors ?? []), ...errors];
   const settings = { ...defaults, ...patch };
-  if (all.length) disarm(settings);
-  return { settings, notes: all.map((error) => error.text) };
+  const notes = all.map((error) => error.text);
+  if (all.length && killArmed(settings)) {
+    disarm(settings);
+    notes.push("automatic kill is off for this command, because its settings were not understood completely");
+  }
+  return { settings, notes };
 }
 
 const DIRECTIVE = /^\s*#+\s*watchdog\s*:\s*(.*)$/i;
@@ -179,13 +186,12 @@ export function shellName(shell) {
  * Applied only for shells known to treat that line as a comment.
  */
 export function parseDirective(command, shell) {
-  const none = { found: false, off: false, values: {}, errors: [] };
+  const none = { found: false, off: false, pairs: [], errors: [] };
   if (!DIRECTIVE_SHELLS.has(shellName(shell))) return none;
   const first = String(command ?? "").split(/\r?\n/, 1)[0];
   const match = DIRECTIVE.exec(first);
   if (!match) return none;
-  const directive = { found: true, off: false, values: {}, errors: [] };
-  const seen = new Set();
+  const directive = { found: true, off: false, pairs: [], errors: [] };
   for (const token of match[1].trim().split(/[\s,]+/).filter(Boolean)) {
     if (/^(off|disabled?|none)$/i.test(token)) {
       directive.off = true;
@@ -198,11 +204,8 @@ export function parseDirective(command, shell) {
       directive.errors.push({ key: undefined, text: `could not read "${token}" (expected name=value)` });
       continue;
     }
-    // The same spelling twice would silently overwrite itself in `values`.
-    if (seen.has(name)) directive.errors.push({ key, text: `"${name}" is given more than once` });
-    seen.add(name);
     // A setting named without a value is kept, so that it is rejected under its own name.
-    directive.values[name] = eq < 0 ? "" : token.slice(eq + 1).replace(/^["']|["']$/g, "");
+    directive.pairs.push([name, eq < 0 ? "" : token.slice(eq + 1).replace(/^["']|["']$/g, "")]);
   }
   return directive;
 }
@@ -211,28 +214,28 @@ export function parseDirective(command, shell) {
 export function parseOptions(raw) {
   const input = raw && typeof raw === "object" ? raw : {};
   const errors = [];
-  const settingInput = {};
-  const rest = {};
+  const settingPairs = [];
+  const rest = new Map();
   for (const [key, value] of Object.entries(input)) {
-    if (settingKey(key)) settingInput[key] = value;
-    else rest[key] = value;
+    if (settingKey(key)) settingPairs.push([key, value]);
+    else rest.set(key, value);
   }
-  const parsed = parseSettings(settingInput);
+  const parsed = parseSettings(settingPairs);
   const settings = { ...SETTING_DEFAULTS, ...parsed.patch };
   for (const error of parsed.errors) errors.push(error.text);
 
   const options = { ...OPTION_DEFAULTS, ignore: [] };
   const duration = (key, min) => {
-    if (rest[key] === undefined) return;
-    const ms = parseDuration(rest[key]);
-    if (ms === undefined || ms < min) errors.push(`${key} needs a duration of at least ${formatDuration(min)}, not "${rest[key]}"`);
+    if (rest.get(key) === undefined) return;
+    const ms = parseDuration(rest.get(key));
+    if (ms === undefined || ms < min) errors.push(`${key} needs a duration of at least ${formatDuration(min)}, not "${rest.get(key)}"`);
     else options[key] = ms;
   };
   const number = (key, min, max, integer) => {
-    if (rest[key] === undefined) return;
-    const value = Number(rest[key]);
+    if (rest.get(key) === undefined) return;
+    const value = Number(rest.get(key));
     if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) {
-      errors.push(`${key} must be ${integer ? "an integer" : "a number"} from ${min} to ${max}, not "${rest[key]}"`);
+      errors.push(`${key} must be ${integer ? "an integer" : "a number"} from ${min} to ${max}, not "${rest.get(key)}"`);
     } else options[key] = value;
   };
   duration("tick", 1000);
@@ -241,16 +244,16 @@ export function parseOptions(raw) {
   number("maxReports", 1, 100, true);
   number("maxWakes", 0, 10_000, true);
   number("tailLines", 0, 50, true);
-  if (rest.resume !== undefined) {
-    if (typeof rest.resume === "boolean") options.resume = rest.resume;
-    else errors.push(`resume must be true or false, not "${rest.resume}"`);
+  if (rest.get("resume") !== undefined) {
+    if (typeof rest.get("resume") === "boolean") options.resume = rest.get("resume");
+    else errors.push(`resume must be true or false, not "${rest.get("resume")}"`);
   }
-  if (rest.log !== undefined) {
-    if (typeof rest.log === "string") options.log = rest.log;
+  if (rest.get("log") !== undefined) {
+    if (typeof rest.get("log") === "string") options.log = rest.get("log");
     else errors.push("log must be a file path");
   }
-  if (rest.ignore !== undefined) {
-    const list = Array.isArray(rest.ignore) ? rest.ignore : [rest.ignore];
+  if (rest.get("ignore") !== undefined) {
+    const list = Array.isArray(rest.get("ignore")) ? rest.get("ignore") : [rest.get("ignore")];
     for (const source of list) {
       try {
         options.ignore.push(new RegExp(String(source)));
@@ -260,7 +263,7 @@ export function parseOptions(raw) {
     }
   }
   const known = new Set(Object.keys(OPTION_DEFAULTS));
-  for (const key of Object.keys(rest)) if (!known.has(key)) errors.push(`unknown option "${key}"`);
+  for (const key of rest.keys()) if (!known.has(key)) errors.push(`unknown option "${key}"`);
   if (errors.length) disarm(settings);
   return { options, settings, errors };
 }
