@@ -727,6 +727,21 @@ test("a kill limit comes into force only when the guard of this very shell has m
   await slow.w.run(slow.a, 1.5 * MIN);
   assert.deepEqual(slow.w.stops, [FIRST_CLAIM]);
 
+  // The claim file is there and still empty (its guard is between creating and writing it): not
+  // yet a claim, and not somebody else's either.
+  const empty = await started();
+  empty.w.claims.set(FIRST_CLAIM, { pid: "", stop: false });
+  empty.w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
+  await empty.w.run(empty.a, TICK);
+  const half = empty.w.state.shells.get("sh_1");
+  assert.deepEqual([half.bound, half.claim, half.settings.killSilence > 0], [false, FIRST_CLAIM, true]);
+  assert.equal(empty.a.sent.length, 0);
+  empty.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
+  await empty.w.run(empty.a, TICK);
+  assert.equal(half.bound, true);
+  await empty.w.run(empty.a, 1.5 * MIN);
+  assert.deepEqual(empty.w.stops, [FIRST_CLAIM]);
+
   // A claims directory that cannot be read counts as a guard that did not start.
   const unreadable = await started();
   unreadable.w.shell("sh_1", { pid: 100, command: KILL_COMMAND });
