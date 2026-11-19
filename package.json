@@ -1,0 +1,25 @@
+{
+  "name": "opencode-shell-watchdog",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: tells the agent when a background shell command has gone silent or started repeating itself, so a hung script cannot stall a session for hours.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Andrei Loginov",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dukelog/opencode-shell-watchdog.git"
+  },
+  "homepage": "https://github.com/dukelog/opencode-shell-watchdog#readme",
+  "bugs": "https://github.com/dukelog/opencode-shell-watchdog/issues",
+  "keywords": ["opencode", "opencode-plugin", "watchdog", "shell", "background", "agent"],
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
