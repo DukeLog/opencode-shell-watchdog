@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CLAIM_ENV, addTag, guardLine, parseOptions, splitTag } from "../src/core.js";
+import { CLAIM_ENV, addTag, createRecord, guardLine, parseOptions, splitTag } from "../src/core.js";
 import { addInstance, beforeCreate, createState, handleEvent, ownerOf, removeInstance, takeLines, tick, toolCall } from "../src/watchdog.js";
 
 const MIN = 60_000;
@@ -985,6 +985,103 @@ test("commands without a kill limit are started exactly as they were given", asy
   beforeCreate(w.state, w.io, a, event, w.newTag);
   assert.equal(event.command, unlimited);
   assert.equal(w.state.issued.size, 0);
+});
+
+test("kill: a line of the author that looks like the guard line opens no settings below it", async () => {
+  const { w, a } = await started();
+  const command = "# watchdog: kill-silence=1h silence=off\necho ready # shell-watchdog guard\n# watchdog: kill-runtime=1m\nsleep 600";
+  const event = { command, shell: "/bin/zsh", env: {} };
+  beforeCreate(w.state, w.io, a, event, w.newTag);
+  assert.deepEqual(splitTag(event.command), { tag: FIRST_TAG, command });
+  w.state.issued.clear();
+  w.tags = 0;
+
+  w.shell("sh_1", { pid: 100, command });
+  const rec = w.state.shells.get("sh_1");
+  assert.deepEqual([rec.command, rec.tag, rec.settings.killSilence, rec.settings.killRuntime], [command, FIRST_TAG, 60 * MIN, 0]);
+  let n = 0;
+  await w.run(a, 30 * MIN, () => w.print("sh_1", `step ${n++}\n`));
+  assert.deepEqual(w.stops, [], "the limit below the head was never in force");
+  assert.equal(a.sent.length, 0);
+});
+
+test("a plugin update on a running server: what the older version made of a command is made again", async () => {
+  // Instances of both versions follow the same events for a while. The older one reads the first
+  // line only: of a command that opens with its name it sees neither the settings nor the tag.
+  const old = (w, a, id, pid, command, extra = {}) => {
+    w.files.set(`/out/${id}`, { ino: pid, data: Buffer.alloc(0) });
+    w.alive.add(pid);
+    const { generation, ...rec } = createRecord({ id, sessionID: "ses_1", pid, file: `/out/${id}`, command, shell: "/bin/zsh", dir: "/a", workspace: null, startedWall: w.wall, ...extra }, a.settings);
+    w.state.shells.set(id, rec);
+    return rec;
+  };
+  const launch = (w, a, command) => {
+    const event = { command, shell: "/bin/zsh", env: {} };
+    beforeCreate(w.state, w.io, a, event, w.newTag);
+    return event.command;
+  };
+
+  // A kill limit below a name: the new hook launched it, the old handler saw it first.
+  const { w, a } = await started();
+  const named = "# nightly build\n# watchdog: kill-runtime=3m silence=off\n./job.sh";
+  const text = launch(w, a, named);
+  w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
+  const before = old(w, a, "sh_1", 100, text);
+  assert.deepEqual([before.tag, before.settings.killRuntime, before.generation], [null, 0, undefined]);
+  w.created("sh_1", { pid: 100, command: text });
+  const rec = w.state.shells.get("sh_1");
+  assert.notEqual(rec, before);
+  assert.deepEqual([rec.generation, rec.command, rec.tag, rec.claim, rec.settings.killRuntime, rec.settings.silence, rec.directed], [2, named, FIRST_TAG, FIRST_CLAIM, 3 * MIN, 0, true]);
+  assert.equal(w.state.issued.size, 0, "its tag is used, once");
+  // The event comes again, from every other instance that follows it: nothing more happens.
+  w.created("sh_1", { pid: 100, command: text });
+  assert.equal(w.state.shells.get("sh_1"), rec);
+  let n = 0;
+  await w.run(a, 3.5 * MIN, () => w.print("sh_1", `step ${n++}\n`));
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
+  assert.match(a.sent[0].text, /sh_1 is being stopped by the watchdog: ran for 3m, limit kill-runtime=3m/);
+
+  // Settings without a kill limit, and a command that is not to be watched at all.
+  const plain = await started();
+  old(plain.w, plain.a, "sh_1", 100, "# train the model\n# watchdog: report=2m silence=off\n./train.sh");
+  old(plain.w, plain.a, "sh_2", 200, "# local preview\n# watchdog: off\nnpm run dev");
+  plain.w.created("sh_1", { pid: 100, command: "# train the model\n# watchdog: report=2m silence=off\n./train.sh" });
+  plain.w.created("sh_2", { pid: 200, command: "# local preview\n# watchdog: off\nnpm run dev" });
+  assert.deepEqual([...plain.w.state.shells.keys()], ["sh_1"]);
+  assert.deepEqual([plain.w.state.shells.get("sh_1").settings.report, plain.w.state.shells.get("sh_1").settings.silence], [2 * MIN, 0]);
+  await plain.w.run(plain.a, 12 * MIN);
+  assert.equal(plain.a.sent.length, 6, "the status every 2m, and no stall report for either");
+  assert.doesNotMatch(plain.a.sent.map((message) => message.text).join("\n"), /sh_2|no output for/);
+
+  // What the older version read correctly stays as it is: a command that came with its tag (the
+  // tag is used up and could not be had again), and one that something has happened to since.
+  const kept = await started();
+  const oldLayout = `# shell-watchdog:${FIRST_TAG}\n${guardLine()}\n${KILL_COMMAND}`;
+  kept.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
+  const tagged = old(kept.w, kept.a, "sh_1", 100, KILL_COMMAND, { tag: FIRST_TAG, claim: FIRST_CLAIM });
+  tagged.settings.killSilence = 2 * MIN;
+  tagged.settings.silence = 0;
+  kept.w.created("sh_1", { pid: 100, command: oldLayout });
+  assert.equal(kept.w.state.shells.get("sh_1"), tagged);
+  const seen = old(kept.w, kept.a, "sh_2", 200, "# nightly build\n# watchdog: report=2m\n./job.sh");
+  await kept.w.run(kept.a, TICK, () => kept.w.print("sh_2", `line ${n++}\n`));
+  kept.w.created("sh_2", { pid: 200, command: "# nightly build\n# watchdog: report=2m\n./job.sh" });
+  assert.equal(kept.w.state.shells.get("sh_2"), seen, "not after a pass has looked at it");
+  assert.equal(seen.settings.report, 0);
+  await kept.w.run(kept.a, 2 * MIN, () => kept.w.print("sh_2", `line ${n++}\n`));
+  assert.deepEqual(kept.w.stops, [FIRST_CLAIM], "the limit of the command that came with its tag is in force");
+
+  // A command without an owner yet, held by the older version as it came in.
+  const waiting = world();
+  const first = waiting.instance("/a");
+  waiting.session("ses_1");
+  await tick(waiting.state, waiting.io, first);
+  const forB = "# for another location\n# watchdog: report=2m silence=off\n./job.sh";
+  waiting.state.pending.set("sh_1", { raw: { id: "sh_1", sessionID: "ses_1", pid: 100, file: "/out/sh_1", command: forB, tag: null, claim: null, foreignTag: false, shell: "/bin/zsh", dir: "/b", workspace: null, startedWall: waiting.wall }, at: 0 });
+  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB });
+  assert.equal(waiting.state.pending.get("sh_1").raw.generation, 2);
+  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB });
+  assert.equal(waiting.state.pending.size, 1);
 });
 
 test("kill limits exist only for commands with a guard; the tool cannot add one later", async () => {

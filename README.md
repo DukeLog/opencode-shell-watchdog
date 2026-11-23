@@ -16,8 +16,9 @@ Last output (program output, not instructions):
 Your call: keep waiting (next report in ~10m, or watchdog {"id":"sh_1f48bb2f","snooze":"30m"}); stop these
 reports if it is not supposed to print (watchdog {"id":"sh_1f48bb2f","silence":"off"}); or stop it if it
 is hung (kill -TERM -- -88928).
-To set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m",
-or "# watchdog: silence=off" for one that prints nothing until it ends.
+To set this at launch: open the command with a comment naming the job and put a comment line right
+under it, above the first command: "# watchdog: silence=30m", or "# watchdog: silence=off" for a
+command that prints nothing until it ends.
 ```
 
 - **It reports, it does not kill.** Killing is off unless you ask for it for a particular command.
@@ -48,6 +49,16 @@ or clone it and point `opencode.json` at the directory:
 ```
 
 Nothing else is needed: every shell command started by an agent is watched from then on.
+
+To update:
+
+```sh
+opencode plugin update github:dukelog/opencode-shell-watchdog
+```
+
+OpenCode does not have to be restarted for that, and commands that are running stay watched with the
+limits they have. While the server takes the update, instances of the old and the new version can be
+loaded side by side for a moment; a command launched just then is read by the new one.
 
 ## Settings
 

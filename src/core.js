@@ -381,8 +381,10 @@ export function createRecord(raw, settings, notes = []) {
     startedWall: raw.startedWall,
     settings: { ...settings },
     notes: [...notes],
-    // directed: the command came with a watchdog line of its own.
+    // directed: the command came with a watchdog line of its own. generation: of the code that made
+    // the record from its `shell.created` event (see GENERATION in watchdog.js).
     directed: raw.directed === true,
+    generation: raw.generation ?? 1,
     rev: 0,
     clock: 0,
 
@@ -602,7 +604,6 @@ export function killReason(rec) {
 const TAG_PREFIX = "# shell-watchdog:";
 const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const GUARD_MARK = " # shell-watchdog guard";
-const GUARD_LINE = /^[^\n]* # shell-watchdog guard\r?\n/;
 export const CLAIM_ENV = "SHELL_WATCHDOG_CLAIM";
 export const GUARD_POLL = 3;
 export const GUARD_GRACE = 5;
@@ -631,10 +632,21 @@ export function guardScript({ poll = GUARD_POLL, grace = GUARD_GRACE } = {}) {
   ].join("; ");
 }
 
+const guardAround = (script) => `( '/bin/sh' '-c' '${script}' 'sh' "$$" <'/dev/null' >'/dev/null' 2>&1 & ); 'unset' '${CLAIM_ENV}'${GUARD_MARK}`;
+
 /** The line that starts the guard of a command and takes the claim out of the command's own environment. */
 export function guardLine(timing) {
-  return `( '/bin/sh' '-c' '${guardScript(timing)}' 'sh' "$$" <'/dev/null' >'/dev/null' 2>&1 & ); 'unset' '${CLAIM_ENV}'${GUARD_MARK}`;
+  return guardAround(guardScript(timing));
 }
+
+// A whole line as guardLine() makes it, whatever its script says. Told by all of its text, not by how
+// it ends: a line of the command's author is never taken for one.
+const GUARD_LINE = new RegExp(
+  `^${guardAround("\0")
+    .split("\0")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[^'\\n]*")}\\r?\\n`,
+);
 
 /** The head of a command as whole lines, each with its place in the text; `end` is past the newline. */
 function headOf(text) {
@@ -659,22 +671,30 @@ export function addTag(command, tag, timing) {
 
 /**
  * Takes the tag lines out of a command: { tag, command }. tag is null when there is none. A tag is a
- * whole line of the head; when there are several, the last one counts and all of them go, with the
- * guard lines that follow the head.
+ * whole line of the head; when there are several, the last one counts and all of them go. With every
+ * tag line goes one guard line, if it is what follows the head, and never a line more: what
+ * addTag() put in comes out, and nothing else does.
  */
 export function splitTag(command) {
   const text = String(command ?? "");
   const head = headOf(text);
   let tag = null;
+  let tags = 0;
   let kept = "";
   for (const line of head) {
     const match = TAG_LINE.exec(line.text);
-    if (match) tag = match[1].toLowerCase();
-    else kept += text.slice(line.start, line.end);
+    if (match) {
+      tag = match[1].toLowerCase();
+      tags += 1;
+    } else kept += text.slice(line.start, line.end);
   }
   if (tag === null) return { tag: null, command: text };
   let rest = text.slice(head.at(-1).end);
-  for (let guard = GUARD_LINE.exec(rest); guard; guard = GUARD_LINE.exec(rest)) rest = rest.slice(guard[0].length);
+  for (; tags > 0; tags--) {
+    const guard = GUARD_LINE.exec(rest);
+    if (!guard) break;
+    rest = rest.slice(guard[0].length);
+  }
   return { tag, command: kept + rest };
 }
 
@@ -786,7 +806,7 @@ function outputBlock(tail, rec) {
 
 const call = (id, extra) => `watchdog ${JSON.stringify({ id, ...extra })}`;
 
-const LAUNCH_HINT = 'To set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m", or "# watchdog: silence=off" for one that prints nothing until it ends.';
+const LAUNCH_HINT = 'To set this at launch: open the command with a comment naming the job and put a comment line right under it, above the first command: "# watchdog: silence=30m", or "# watchdog: silence=off" for a command that prints nothing until it ends.';
 
 /**
  * One report block for one command.

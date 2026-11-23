@@ -159,10 +159,32 @@ export function handleEvent(state, io, event) {
   }
 }
 
+// How a record is made from a `shell.created` event. 2: settings and tag are read from the head of the
+// command; before that, from its first line alone.
+const GENERATION = 2;
+
+/**
+ * Was this made by an older version of the plugin, and is it still as it was made? While a server
+ * takes a plugin update, instances of both versions follow the same events for a while, and the
+ * older one may see a command first: it reads the first line only, so it misses settings and tag
+ * of a command that opens with a name. Such a record is made again by the first newer instance
+ * that sees the event, as long as nothing has happened to it. One that came with its tag was read
+ * correctly, and its tag is used up: it stays.
+ */
+function outdated(state, id) {
+  const rec = state.shells.get(id);
+  const made = rec ?? state.pending.get(id)?.raw;
+  if (!made || (made.generation ?? 1) >= GENERATION || made.tag) return false;
+  return !rec || (rec.clock === 0 && rec.rev === 0 && rec.lastReport === 0 && rec.episode.reports === 0 && !rec.checkAt && !rec.killed);
+}
+
 function onCreated(state, io, info, location) {
   const id = info?.id;
   if (typeof id !== "string" || !Number.isInteger(info.pid) || info.pid <= 1) return;
-  if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
+  if (outdated(state, id)) {
+    state.shells.delete(id);
+    state.pending.delete(id);
+  } else if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
   const started = Number(info.time?.started);
   // Events may come late and more than once, but a pid has one owner at a time. An event about a
   // start that is known to be older than a watched command of the same pid is about a command that
@@ -197,6 +219,7 @@ function onCreated(state, io, info, location) {
     dir: location.directory,
     workspace: location.workspaceID ?? null,
     startedWall: started,
+    generation: GENERATION,
   };
   const owner = ownerOf(state, raw);
   if (owner) return activate(state, io, owner, raw);
@@ -714,7 +737,7 @@ export async function toolCall(state, io, inst, input, sessionID) {
   }
   if (KILL_SETTINGS.some((key) => patch[key] > 0) && !own.tag) {
     errors.push(
-      'a kill limit cannot be added to a command that was launched without one: give it at launch, as the first line of the command, e.g. "# watchdog: kill-runtime=2h"',
+      'a kill limit cannot be added to a command that was launched without one: give it at launch, in a comment line right under a first comment naming the job and above the first command, e.g. "# watchdog: kill-runtime=2h"',
     );
   }
   const options = (ownerOf(state, own) ?? inst).options;

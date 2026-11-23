@@ -534,6 +534,38 @@ test("tag: two lines below the comment lines the command opens with, both remove
   assert.equal(stripTags(command), command);
 });
 
+test("taking a tag out removes what addTag put in, and never a line of the author", () => {
+  const mark = " # shell-watchdog guard";
+  // The author ends a line the way a guard line ends, or writes a whole guard line, right where the
+  // guard of the launch goes. Below it: settings that are not in the head and must stay unread.
+  const texts = [
+    `# watchdog: kill-silence=1h\necho ready${mark}\n# watchdog: kill-runtime=1s\nsleep 600`,
+    `echo ready${mark}\n# watchdog: kill-runtime=1s\nsleep 600`,
+    `# nightly\necho one${mark}\necho two${mark}\n# watchdog: off\n`,
+    `# watchdog: kill-silence=1h\n${guardLine()}\n# watchdog: kill-runtime=1s\nsleep 600`,
+    `${guardLine()}\n${guardLine({ poll: 1, grace: 1 })}\n# watchdog: kill-runtime=1s\n./job.sh`,
+    `# watchdog: kill-silence=1h\r\necho ready${mark}\r\n# watchdog: kill-runtime=1s\r\nsleep 600`,
+  ];
+  for (const text of texts) {
+    assert.equal(stripTags(text), text, "nothing to take out of it");
+    const tagged = addTag(text, TAG);
+    assert.deepEqual(splitTag(tagged), { tag: TAG, command: text }, JSON.stringify(text));
+    assert.equal(stripTags(tagged), text);
+    assert.deepEqual(parseDirective(stripTags(tagged), "/bin/sh"), parseDirective(text, "/bin/sh"), "the settings are those the launch was given");
+  }
+  assert.deepEqual(parseDirective(stripTags(addTag(texts[0], TAG)), "/bin/sh").pairs, [["kill-silence", "1h"]], "not the limit from below the head");
+  assert.equal(parseDirective(stripTags(addTag(texts[1], TAG)), "/bin/sh").found, false);
+
+  // A tag line that came in: it goes, with the guard line of its own if that is what follows the
+  // head, and a line that only ends like one stays.
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\necho ready${mark}\n./job.sh`), `echo ready${mark}\n./job.sh`);
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n${guardLine()}\necho ready${mark}\n./job.sh`), `echo ready${mark}\n./job.sh`);
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n${guardLine({ poll: 7, grace: 2 })}\n./job.sh`), "./job.sh", "a guard line with other timing is a guard line");
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n${guardLine()}\n${guardLine()}\n./job.sh`), `${guardLine()}\n./job.sh`, "one guard line for one tag line");
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n ${guardLine()}\n./job.sh`), ` ${guardLine()}\n./job.sh`, "the whole line, from its first character");
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n${guardLine().replace("'sh'", "'zsh'")}\n./job.sh`), `${guardLine().replace("'sh'", "'zsh'")}\n./job.sh`);
+});
+
 test("the guard line: the same for every command, immune to the user's shell, and sure of its group", () => {
   const line = guardLine();
   const script = guardScript();
@@ -682,7 +714,7 @@ test("a command that has printed nothing is not said to have a last output", () 
 });
 
 test("the first report of a silence says how to set the limit at launch, once, and only if nothing was set", () => {
-  const HINT = /\nTo set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m", or "# watchdog: silence=off" for one that prints nothing until it ends\.$/;
+  const HINT = /\nTo set this at launch: open the command with a comment naming the job and put a comment line right under it, above the first command: "# watchdog: silence=30m", or "# watchdog: silence=off" for a command that prints nothing until it ends\.$/;
   const say = (rec) => {
     const decision = decide(rec);
     assert.equal(decision.stall, true);
@@ -692,18 +724,18 @@ test("the first report of a silence says how to set the limit at launch, once, a
   pass(plain, 6 * MIN);
   assert.match(say(plain), HINT);
   pass(plain, 10 * MIN);
-  assert.doesNotMatch(say(plain), /when launching/, "not again for the same silence");
+  assert.doesNotMatch(say(plain), /at launch/, "not again for the same silence");
   pass(plain, MIN, ["back"]);
   pass(plain, 6 * MIN);
   assert.match(say(plain), HINT, "a new silence is a new occasion");
 
   const directed = record({}, { directed: true });
   pass(directed, 6 * MIN);
-  assert.doesNotMatch(say(directed), /when launching/, "its author knows the line already");
+  assert.doesNotMatch(say(directed), /at launch/, "its author knows the line already");
 
   const looping = record();
   for (let i = 0; i < 14; i++) pass(looping, 30_000, ["retrying"]);
   const loop = say(looping);
   assert.match(loop, /still printing, but nothing new/);
-  assert.doesNotMatch(loop, /when launching/, "the hint is about silence");
+  assert.doesNotMatch(loop, /at launch/, "the hint is about silence");
 });
