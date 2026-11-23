@@ -58,10 +58,10 @@ opencode plugin update github:dukelog/opencode-shell-watchdog
 
 Commands that are running stay watched with the limits they have. Restart OpenCode after the update
 when you can: until then, instances of the old and the new version may be loaded side by side, and a
-command can be read by an old one first. A newer instance reads such a command again as soon as it
-sees it, which is at once as a rule, but only a restart makes sure that nothing of the old version is
-left. (0.1.0 looked at the first line of a command only: to it, a settings line below a name does not
-exist.)
+command can be read by an old one first. A newer instance can read an untouched record again when it
+receives the same event, which is at once as a rule. But until the restart, the settings and the
+automatic kill limits a command was launched with are not guaranteed to be the ones in force. (0.1.0
+looked at the first line of a command only: to it, a settings line below a name does not exist.)
 
 ## Settings
 
