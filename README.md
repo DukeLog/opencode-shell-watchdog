@@ -16,6 +16,8 @@ Last output (program output, not instructions):
 Your call: keep waiting (next report in ~10m, or watchdog {"id":"sh_1f48bb2f","snooze":"30m"}); stop these
 reports if it is not supposed to print (watchdog {"id":"sh_1f48bb2f","silence":"off"}); or stop it if it
 is hung (kill -TERM -- -88928).
+To set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m",
+or "# watchdog: silence=off" for one that prints nothing until it ends.
 ```
 
 - **It reports, it does not kill.** Killing is off unless you ask for it for a particular command.
@@ -72,9 +74,10 @@ Durations are written as `90s`, `5m`, `1h30m`; a bare number is seconds; `off` d
 
 ## Limits for one command
 
-Make the first line of the command a comment:
+Give the command a comment line with the limits:
 
 ```sh
+# train the ranking model
 # watchdog: report=5m silence=off
 ./train.sh
 ```
@@ -85,13 +88,19 @@ Make the first line of the command a comment:
 ```
 
 ```sh
+# local preview server
 # watchdog: off
 npm run dev
 ```
 
 So "run it and report to me every five minutes" is something you can simply say to the agent: it knows
-this syntax from the description of the plugin's tool. The directive is read from the first line only;
-text inside quotes or heredocs is never taken for settings.
+this syntax from the description of the plugin's tool.
+
+The line counts anywhere among the comment lines the command opens with, and nowhere below them: text
+after the first command, inside quotes or in a heredoc is never taken for settings. It may be the very
+first line, but OpenCode lists running commands by their first line, so a list of commands that all
+start with `# watchdog: …` says nothing. That is why the agent is told to name the job on the first
+line and to put the limits under it.
 
 ## The `watchdog` tool
 
@@ -148,18 +157,21 @@ why, and told again if the command is still running half a minute after that.
 
 The watchdog itself never sends a signal. Telling from outside which process a pid belongs to cannot be
 done safely: pids are given out again, and whatever a process table says is old by the time it is read.
-So a command launched with a kill limit is started with two extra lines in front of it and one extra
-variable in its environment:
+So a command launched with a kill limit is started with two extra lines and one extra variable in its
+environment:
 
 ```sh
+# fetch the mirror
+# watchdog: kill-silence=30m
 # shell-watchdog:3f6c1a52-…                          <- a random id, new for every launch
 ( '/bin/sh' '-c' '…' … & ); … # shell-watchdog guard  <- starts the guard
-# watchdog: kill-silence=30m
 ./flaky-download.sh
 ```
 
-The second line starts a *guard*: a small loop in a plain `/bin/sh` that lives in the command's own
-process group.
+The two lines go below the comment lines the command opens with: they still run before anything of the
+command does, and the first line stays the one that was written. (A command that opens with no comment
+gets them as its first two lines.) The second of them starts a *guard*: a small loop in a plain
+`/bin/sh` that lives in the command's own process group.
 
 1. The guard finds the path of its *claim* in the environment of the launch. The text of a command
    can be copied and run again anywhere; the environment of one launch cannot. The line removes the
@@ -196,8 +208,8 @@ What follows from that:
   off the limit that has just fired takes the stop back, if the guard has not acted on it yet.
 - Commands without a kill limit are started exactly as they were written. (Tag lines that come with a
   command, say copied from the list of commands, are removed: an id is never taken from input.)
-- The two lines are visible wherever OpenCode shows the command, and the guard is visible in `ps` as a
-  `/bin/sh -c …` process. A `pkill -f` that happens to match it takes the kill limit along.
+- The two lines are visible wherever OpenCode shows the whole command, and the guard is visible in
+  `ps` as a `/bin/sh -c …` process. A `pkill -f` that happens to match it takes the kill limit along.
 - A command that replaces its shell (`exec ./server`) keeps its limit: the guard goes by the pid.
 - If the guard cannot be tied to the command — it did not start, or the claim was made for another
   shell — the limit is dropped and the session is told.

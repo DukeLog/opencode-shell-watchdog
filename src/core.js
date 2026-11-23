@@ -175,23 +175,38 @@ export function shellName(shell) {
   return String(shell ?? "").split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
 }
 
+// The head of a command: the comment lines it opens with. Nothing runs before them, and no quote or
+// heredoc can be open across them. So the head is the only place where text is read as settings, and
+// its end is the only place where lines are put into a command (see addTag). A comment that ends in a
+// backslash is not taken as part of it: nothing is to depend on how a shell reads that.
+const isHeadLine = (line) => /^[ \t]*#/.test(line) && !line.endsWith("\\");
+
 /**
- * Per-command settings: a comment that is the first line of the command.
+ * Per-command settings: a comment among the comment lines the command opens with.
  *
+ *     # train the ranking model
  *     # watchdog: report=5m silence=off
  *     ./train.sh
  *
- * Only the first line is looked at, so text inside quotes or heredocs is never read as settings.
- * Applied only for shells known to treat that line as a comment.
+ * The line above it is for the reader: lists of running commands show the first line of a command.
+ * Nothing below the head is looked at, so text inside quotes or heredocs is never read as settings.
+ * Applied only for shells known to treat those lines as comments.
  */
 export function parseDirective(command, shell) {
   const none = { found: false, off: false, pairs: [], errors: [] };
   if (!DIRECTIVE_SHELLS.has(shellName(shell))) return none;
-  const first = String(command ?? "").split(/\r?\n/, 1)[0];
-  const match = DIRECTIVE.exec(first);
-  if (!match) return none;
+  const tokens = [];
+  let found = false;
+  for (const line of String(command ?? "").split(/\r?\n/)) {
+    if (!isHeadLine(line)) break;
+    const match = DIRECTIVE.exec(line);
+    if (!match) continue;
+    found = true;
+    tokens.push(...match[1].trim().split(/[\s,]+/).filter(Boolean));
+  }
+  if (!found) return none;
   const directive = { found: true, off: false, pairs: [], errors: [] };
-  for (const token of match[1].trim().split(/[\s,]+/).filter(Boolean)) {
+  for (const token of tokens) {
     if (/^(off|disabled?|none)$/i.test(token)) {
       directive.off = true;
       continue;
@@ -366,6 +381,8 @@ export function createRecord(raw, settings, notes = []) {
     startedWall: raw.startedWall,
     settings: { ...settings },
     notes: [...notes],
+    // directed: the command came with a watchdog line of its own.
+    directed: raw.directed === true,
     rev: 0,
     clock: 0,
 
@@ -548,12 +565,15 @@ export function killReason(rec) {
 //
 // The watchdog never sends a signal. Telling which process a pid belongs to cannot be done safely from
 // outside: pids are given out again, and what `ps` says is already old when it is read. Instead, a
-// command that is launched with a kill limit gets two lines in front of it and one variable in its
-// environment:
+// command that is launched with a kill limit gets two lines and one variable in its environment:
 //
 //     # shell-watchdog:<id>                  a random id, new for every launch
 //     ( '/bin/sh' '-c' '…' … & ); … # shell-watchdog guard
 //     SHELL_WATCHDOG_CLAIM=<claims>/<id>     in the environment of that one launch
+//
+// The two lines go below the head of the command (the comment lines it opens with), so they still run
+// before anything of the command does, and the first line of the command stays the one its author
+// wrote: that line is what lists of running commands show.
 //
 // The second line starts a guard: a small loop in a plain /bin/sh, in the command's own process group.
 // The guard
@@ -580,7 +600,7 @@ export function killReason(rec) {
 // The guard is started from a subshell that exits at once, so it is not a job of the command: `wait`,
 // `jobs` and `$!` do not see it. It leaves when the command's shell is gone or its claim is removed.
 const TAG_PREFIX = "# shell-watchdog:";
-const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\r?\n/i;
+const TAG_LINE = /^# shell-watchdog:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const GUARD_MARK = " # shell-watchdog guard";
 const GUARD_LINE = /^[^\n]* # shell-watchdog guard\r?\n/;
 export const CLAIM_ENV = "SHELL_WATCHDOG_CLAIM";
@@ -616,18 +636,46 @@ export function guardLine(timing) {
   return `( '/bin/sh' '-c' '${guardScript(timing)}' 'sh' "$$" <'/dev/null' >'/dev/null' 2>&1 & ); 'unset' '${CLAIM_ENV}'${GUARD_MARK}`;
 }
 
-export function addTag(command, tag, timing) {
-  return `${tagLine(tag)}\n${guardLine(timing)}\n${command}`;
+/** The head of a command as whole lines, each with its place in the text; `end` is past the newline. */
+function headOf(text) {
+  const lines = [];
+  for (let at = 0; ; ) {
+    const newline = text.indexOf("\n", at);
+    if (newline < 0) break;
+    const line = text.slice(at, newline).replace(/\r$/, "");
+    if (!isHeadLine(line)) break;
+    lines.push({ start: at, end: newline + 1, text: line });
+    at = newline + 1;
+  }
+  return lines;
 }
 
-/** Splits the tag lines off a command: { tag, command }. tag is null when there is none. */
+/** Puts the tag line and the guard line below the head of a command. */
+export function addTag(command, tag, timing) {
+  const text = String(command ?? "");
+  const at = headOf(text).at(-1)?.end ?? 0;
+  return `${text.slice(0, at)}${tagLine(tag)}\n${guardLine(timing)}\n${text.slice(at)}`;
+}
+
+/**
+ * Takes the tag lines out of a command: { tag, command }. tag is null when there is none. A tag is a
+ * whole line of the head; when there are several, the last one counts and all of them go, with the
+ * guard lines that follow the head.
+ */
 export function splitTag(command) {
   const text = String(command ?? "");
-  const match = TAG_LINE.exec(text);
-  if (!match) return { tag: null, command: text };
-  const rest = text.slice(match[0].length);
-  const guard = GUARD_LINE.exec(rest);
-  return { tag: match[1].toLowerCase(), command: guard ? rest.slice(guard[0].length) : rest };
+  const head = headOf(text);
+  let tag = null;
+  let kept = "";
+  for (const line of head) {
+    const match = TAG_LINE.exec(line.text);
+    if (match) tag = match[1].toLowerCase();
+    else kept += text.slice(line.start, line.end);
+  }
+  if (tag === null) return { tag: null, command: text };
+  let rest = text.slice(head.at(-1).end);
+  for (let guard = GUARD_LINE.exec(rest); guard; guard = GUARD_LINE.exec(rest)) rest = rest.slice(guard[0].length);
+  return { tag, command: kept + rest };
 }
 
 /** The command without any tag lines it came with: an id is never taken from input. */
@@ -675,8 +723,10 @@ export function cutBytes(text, max) {
 
 /** The command without its tag and directive lines, on one line. */
 export function shortCommand(command) {
-  const lines = stripTags(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length && DIRECTIVE.test(lines[0])) lines.shift();
+  const all = stripTags(command).split(/\r?\n/);
+  let head = 0;
+  while (head < all.length && isHeadLine(all[head])) head += 1;
+  const lines = [...all.slice(0, head).filter((line) => !DIRECTIVE.test(line)), ...all.slice(head)].map((line) => line.trim()).filter(Boolean);
   if (!lines.length) return "(empty command)";
   const more = lines.length > 1 ? ` … (+${lines.length - 1} more lines)` : "";
   return cutBytes(lines[0], COMMAND_CAP - bytes(more)) + more;
@@ -720,6 +770,8 @@ function stateText(rec, view) {
     return `still printing, but nothing new for ${formatDuration(view.stalledFor)}: ${what}`;
   }
   if (state === "unknown") return `output file cannot be read (${rec.observe})`;
+  // Not a byte so far: there is no last output to speak of.
+  if (!rec.size && !rec.lastGrowth) return "active, no output yet";
   return `active, last output ${formatDuration(view.quietFor)} ago`;
 }
 
@@ -733,6 +785,8 @@ function outputBlock(tail, rec) {
 }
 
 const call = (id, extra) => `watchdog ${JSON.stringify({ id, ...extra })}`;
+
+const LAUNCH_HINT = 'To set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m", or "# watchdog: silence=off" for one that prints nothing until it ends.';
 
 /**
  * One report block for one command.
@@ -758,6 +812,8 @@ export function reportBlock(item) {
         ? `count this output as progress (${call(rec.id, { loop: "off" })})`
         : `stop these reports if it is not supposed to print (${call(rec.id, { silence: "off" })})`;
     lines.push(`Your call: ${wait}; ${quiet}; or stop it if it is hung (kill -TERM -- -${rec.pid}).`);
+    // Said once per stall, and only about a command that was launched without settings of its own.
+    if (view.state === "silent" && rec.episode.reports <= 1 && !rec.directed) lines.push(LAUNCH_HINT);
   } else if (rec.settings.report > 0) {
     lines.push(`Next status in ${formatDuration(rec.settings.report)} (${call(rec.id, { report: "off" })} to stop).`);
   }

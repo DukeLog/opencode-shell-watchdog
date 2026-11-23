@@ -300,9 +300,22 @@ test("per-command settings: periodic reports without stall reports", async () =>
   w.shell("sh_1", { pid: 100, command: "# watchdog: report=2m silence=off\n./train.sh" });
   await w.run(a, 7 * MIN);
   assert.equal(a.sent.length, 3);
-  assert.match(a.sent[0].text, /sh_1 status: active, last output 2m ago \(running 2m, pid 100\)/);
+  assert.match(a.sent[0].text, /sh_1 status: active, no output yet \(running 2m, pid 100\)/);
   assert.match(a.sent[0].text, /\$ \.\/train\.sh/);
   assert.match(a.sent[0].text, /Next status in 2m/);
+});
+
+test("per-command settings below a first line that names the job", async () => {
+  const { w, a } = await started();
+  w.shell("sh_1", { pid: 100, command: "# train the ranking model\n# watchdog: report=2m silence=off\n./train.sh" });
+  w.shell("sh_2", { pid: 200, command: "# local preview server\n# watchdog: off\nnpm run dev" });
+  w.shell("sh_3", { pid: 300, command: "./plain.sh" });
+  assert.deepEqual([...w.state.shells.keys()], ["sh_1", "sh_3"]);
+  assert.deepEqual([w.state.shells.get("sh_1").directed, w.state.shells.get("sh_3").directed], [true, false]);
+  await w.run(a, 2 * MIN, () => w.print("sh_3", "tick\n" + Math.random() + "\n"));
+  assert.equal(a.sent.length, 1);
+  assert.match(a.sent[0].text, /sh_1 status: active, no output yet \(running 2m, pid 100\)\.\n\$ # train the ranking model … \(\+1 more lines\)\n/);
+  assert.doesNotMatch(a.sent[0].text, /sh_3/);
 });
 
 test("only the instance of the command's location acts on it", async () => {
@@ -647,11 +660,11 @@ test("kill: a command launched with a limit gets a guard, which is told to stop 
   assert.equal(a.sent.length, 1);
 });
 
-test("kill: what a launch with a limit gets: two lines in front of the command, and the claim in its environment", async () => {
+test("kill: what a launch with a limit gets: two lines below its opening comments, and the claim in its environment", async () => {
   const { w, a } = await started();
   const event = { command: KILL_COMMAND, shell: "/bin/zsh", env: { PATH: "/bin", [CLAIM_ENV]: "/somebody/else" } };
   beforeCreate(w.state, w.io, a, event, w.newTag);
-  assert.equal(event.command, `# shell-watchdog:${FIRST_TAG}\n${guardLine()}\n${KILL_COMMAND}`);
+  assert.equal(event.command, `# watchdog: kill-silence=2m silence=off\n# shell-watchdog:${FIRST_TAG}\n${guardLine()}\n./job.sh`);
   assert.equal(event.command, addTag(KILL_COMMAND, FIRST_TAG));
   assert.deepEqual(splitTag(event.command), { tag: FIRST_TAG, command: KILL_COMMAND });
   assert.deepEqual(event.env, { PATH: "/bin", [CLAIM_ENV]: FIRST_CLAIM }, "the claim of this launch, not one that came in");
@@ -666,6 +679,26 @@ test("kill: what a launch with a limit gets: two lines in front of the command, 
   const bare = { command: KILL_COMMAND, shell: "/bin/zsh" };
   beforeCreate(w.state, w.io, a, bare, w.newTag);
   assert.deepEqual(bare, { command: KILL_COMMAND, shell: "/bin/zsh" });
+});
+
+test("kill: a command that opens with its name keeps it as the first line, and its limit works the same", async () => {
+  const { w, a } = await started();
+  const command = "# nightly build\n# watchdog: kill-runtime=3m silence=off\n./job.sh";
+  const event = { command, shell: "/bin/zsh", env: { PATH: "/bin" } };
+  beforeCreate(w.state, w.io, a, event, w.newTag);
+  assert.deepEqual(event.command.split("\n"), ["# nightly build", "# watchdog: kill-runtime=3m silence=off", `# shell-watchdog:${FIRST_TAG}`, guardLine(), "./job.sh"]);
+  w.state.issued.clear();
+  w.tags = 0;
+
+  w.shell("sh_1", { pid: 100, command });
+  const rec = w.state.shells.get("sh_1");
+  assert.deepEqual([rec.command, rec.tag, rec.claim, rec.settings.killRuntime, rec.directed], [command, FIRST_TAG, FIRST_CLAIM, 3 * MIN, true]);
+  let n = 0;
+  await w.run(a, 2.5 * MIN, () => w.print("sh_1", `step ${n++}\n`));
+  assert.deepEqual([rec.bound, w.stops.length], [true, 0]);
+  await w.run(a, MIN, () => w.print("sh_1", `step ${n++}\n`));
+  assert.deepEqual(w.stops, [FIRST_CLAIM]);
+  assert.match(a.sent[0].text, /sh_1 is being stopped by the watchdog: ran for 3m, limit kill-runtime=3m\.[^\n]*\n\$ # nightly build … \(\+1 more lines\)$/);
 });
 
 test("kill: a limit by runtime, and limits changed through the tool", async () => {
@@ -1180,7 +1213,7 @@ test("tool: status, changes, and nothing for other sessions", async () => {
   await w.run(a, MIN);
 
   const list = await toolCall(w.state, w.io, a, {}, "ses_1");
-  assert.match(list, /^sh_1: active, last output 1m ago \(running 1m, pid 100\)/);
+  assert.match(list, /^sh_1: active, no output yet \(running 1m, pid 100\)/);
   assert.doesNotMatch(list, /sh_2|theirs/);
   assert.match(await toolCall(w.state, w.io, a, { id: "sh_2" }, "ses_1"), /sh_2 is not a watched command of this session/);
   assert.match(await toolCall(w.state, w.io, a, { id: "sh_2", off: true }, "ses_1"), /not a watched command/);

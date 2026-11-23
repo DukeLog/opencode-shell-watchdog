@@ -216,7 +216,7 @@ function activate(state, io, inst, raw) {
     else if (!inst.claims) why = "the state directory of the watchdog cannot be used";
     notes.push(`kill limits (${why})`);
   }
-  state.shells.set(raw.id, createRecord(raw, settings, notes));
+  state.shells.set(raw.id, createRecord({ ...raw, directed: directive.found }, settings, notes));
   (inst.io ?? io).log({ kind: "watch", id: raw.id, sessionID: raw.sessionID, pid: raw.pid, settings });
 }
 

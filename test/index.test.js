@@ -91,6 +91,8 @@ test("setup registers the hook, the tool and one instance; cleanup takes all of 
     assert.ok(firstParagraph.includes(example), example);
   }
   assert.match(firstParagraph, /Call with no arguments to list watched commands/);
+  assert.match(firstParagraph, /a comment line under a first comment naming the job/, "where the line goes, so that lists of commands stay readable");
+  assert.match(tool.description, /\n# nightly build of the docs\n# watchdog: report=10m silence=off\n\.\/build\.sh\n/, "one whole example");
   const listed = await tool.execute({}, { sessionID: "ses_index" });
   assert.match(listed.content, /No shell command of this session is being watched/);
 
@@ -122,7 +124,15 @@ test("the hook gives every launch of a kill-limited command a guard and a claim 
     assert.match(tags[0].tag, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.notEqual(tags[0].tag, tags[1].tag);
     assert.deepEqual(tags.map((split) => split.command), [text, text]);
-    assert.deepEqual(first.command.split("\n").slice(1), [guardLine(), ...text.split("\n")]);
+    assert.deepEqual(first.command.split("\n"), ["# watchdog: kill-runtime=2h", `# shell-watchdog:${tags[0].tag}`, guardLine(), "./job.sh"]);
+
+    // A command that opens with a name for itself keeps that name as its first line.
+    const named = launch(`# nightly build\n${text}`);
+    await run(named);
+    const mark = splitTag(named.command);
+    assert.deepEqual(named.command.split("\n"), ["# nightly build", "# watchdog: kill-runtime=2h", `# shell-watchdog:${mark.tag}`, guardLine(), "./job.sh"]);
+    assert.equal(mark.command, `# nightly build\n${text}`);
+    assert.equal(named.env[CLAIM_ENV], join(claims(), mark.tag));
     assert.deepEqual(first.env, { PATH: "/bin", [CLAIM_ENV]: join(claims(), tags[0].tag) }, "the claim travels in the environment only");
     assert.equal(second.env[CLAIM_ENV], join(claims(), tags[1].tag));
 
@@ -141,7 +151,7 @@ test("the hook gives every launch of a kill-limited command a guard and a claim 
     await run(unlimited);
     assert.deepEqual(unlimited, launch("# watchdog: report=5m\n./job.sh"));
 
-    for (const split of [...tags, fresh]) assert.equal(sharedState().issued.get(split.tag).claim, join(claims(), split.tag));
+    for (const split of [...tags, mark, fresh]) assert.equal(sharedState().issued.get(split.tag).claim, join(claims(), split.tag));
   } finally {
     sharedState().issued.clear();
     await cleanup();

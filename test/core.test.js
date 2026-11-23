@@ -82,15 +82,39 @@ test("duration formatting", () => {
   assert.equal(formatDuration(120 * MIN), "2h");
 });
 
-test("directive is read from the first line only", () => {
+test("directive is read from the comment lines the command opens with, and nowhere else", () => {
   const directive = parseDirective("# watchdog: report=5m silence=off\n./train.sh", "/bin/zsh");
   assert.equal(directive.found, true);
   assert.deepEqual(directive.pairs, [["report", "5m"], ["silence", "off"]]);
 
+  // The first line is free for a name of the job: that line is what lists of commands show.
+  const named = parseDirective("# train the ranking model\n# watchdog: report=5m silence=off\n./train.sh", "/bin/zsh");
+  assert.equal(named.found, true);
+  assert.deepEqual(named.pairs, [["report", "5m"], ["silence", "off"]]);
+  assert.deepEqual(parseDirective("#!/bin/sh\n# nightly\n  # watchdog: silence=30m\n# more\n./x", "/bin/sh").pairs, [["silence", "30m"]]);
+  assert.deepEqual(parseDirective("# nightly\r\n# watchdog: silence=30m\r\n./x", "/bin/sh").pairs, [["silence", "30m"]]);
+  assert.equal(parseDirective("# watchdog: off", "/bin/sh").off, true, "a command that is nothing but the line");
+  assert.equal(parseDirective("# nightly\n# watchdog: off\n./x", "/bin/sh").off, true);
+
+  // Two such lines are one set of settings; the same key twice is an error, as it is on one line.
+  const two = parseDirective("# watchdog: report=5m\n# nightly\n# watchdog: silence=off\n./x", "/bin/sh");
+  assert.deepEqual(two.pairs, [["report", "5m"], ["silence", "off"]]);
+  const twice = resolveSettings(SETTING_DEFAULTS, parseDirective("# watchdog: kill-runtime=1h\n# watchdog: kill-runtime=2h\n./x", "/bin/sh"));
+  assert.equal(twice.settings.killRuntime, 0);
+  assert.deepEqual(twice.notes, ["kill-runtime is given more than once", "automatic kill is off for this command, because its settings were not understood completely"]);
+
+  // Nothing below the head is read: not after a command, an empty line, or inside quotes and heredocs.
   assert.equal(parseDirective("./train.sh # watchdog: kill-runtime=1s", "/bin/zsh").found, false);
   assert.equal(parseDirective("echo '# watchdog: kill-runtime=1s'", "/bin/bash").found, false);
   assert.equal(parseDirective("cat <<EOF\n# watchdog: kill-runtime=1s\nEOF", "/bin/sh").found, false);
-  assert.equal(parseDirective("\n# watchdog: report=5m\n./x", "/bin/sh").found, false, "not the first line");
+  assert.equal(parseDirective("# to a file\ncat > f <<EOF\n# watchdog: kill-runtime=1s\nEOF", "/bin/sh").found, false);
+  assert.equal(parseDirective("echo '\n# watchdog: kill-runtime=1s\n'", "/bin/sh").found, false);
+  assert.equal(parseDirective("\n# watchdog: report=5m\n./x", "/bin/sh").found, false, "an empty line ends the head");
+  assert.equal(parseDirective("# nightly\n\n# watchdog: report=5m\n./x", "/bin/sh").found, false);
+  assert.equal(parseDirective("cd /srv\n# watchdog: report=5m\n./x", "/bin/sh").found, false);
+  // A comment that ends in a backslash ends the head too, itself included.
+  assert.equal(parseDirective("# odd \\\n# watchdog: report=5m\n./x", "/bin/sh").found, false);
+  assert.equal(parseDirective("# watchdog: report=5m \\\n./x", "/bin/sh").found, false);
 });
 
 test("directive is applied only for shells where # starts a comment", () => {
@@ -463,22 +487,50 @@ test("tag: wanted only when a kill limit is armed and the shell can carry it", (
   assert.equal(wantsTag("# watchdog: kill-runtime=2h reprot=5m\n./job.sh", "/bin/zsh", defaults, "linux"), false, "a directive with an error arms nothing");
 });
 
-test("tag: two lines in front of the command, both removed again", () => {
+test("tag: two lines below the comment lines the command opens with, both removed again", () => {
   const command = "# watchdog: kill-runtime=2h\n./job.sh";
   const tagged = addTag(command, TAG);
   const lines = tagged.split("\n");
-  assert.equal(lines.length, 4);
-  assert.equal(lines[0], `# shell-watchdog:${TAG}`);
-  assert.equal(lines[1], guardLine());
-  assert.ok(lines[1].endsWith(" # shell-watchdog guard"));
+  assert.deepEqual(lines, ["# watchdog: kill-runtime=2h", `# shell-watchdog:${TAG}`, guardLine(), "./job.sh"]);
+  assert.ok(lines[2].endsWith(" # shell-watchdog guard"));
   assert.deepEqual(splitTag(tagged), { tag: TAG, command });
-  assert.deepEqual(parseDirective(splitTag(tagged).command, "/bin/zsh").pairs, [["kill-runtime", "2h"]], "the directive is the first line again");
+  assert.deepEqual(parseDirective(splitTag(tagged).command, "/bin/zsh").pairs, [["kill-runtime", "2h"]]);
+
+  // The first line of the command stays the one its author wrote, whatever the head looks like.
+  const named = "# nightly build\n# watchdog: kill-runtime=2h\n# see the runbook\ncd /srv && ./job.sh\n# done\n";
+  assert.deepEqual(addTag(named, TAG).split("\n"), ["# nightly build", "# watchdog: kill-runtime=2h", "# see the runbook", `# shell-watchdog:${TAG}`, guardLine(), "cd /srv && ./job.sh", "# done", ""]);
+  // Without a head the two lines come first: there is nothing they could go below.
+  assert.deepEqual(addTag("./job.sh", TAG).split("\n"), [`# shell-watchdog:${TAG}`, guardLine(), "./job.sh"]);
+  assert.deepEqual(addTag("\n# late\n./job.sh", TAG).split("\n").slice(0, 3), [`# shell-watchdog:${TAG}`, guardLine(), ""]);
+  // Never below a comment that ends in a backslash, and never into the last line of a text.
+  assert.deepEqual(addTag("# odd \\\n./job.sh", TAG).split("\n"), [`# shell-watchdog:${TAG}`, guardLine(), "# odd \\", "./job.sh"]);
+  assert.deepEqual(addTag("# a\n# odd \\\n./job.sh", TAG).split("\n"), ["# a", `# shell-watchdog:${TAG}`, guardLine(), "# odd \\", "./job.sh"]);
+  assert.deepEqual(addTag("# a\n# b", TAG).split("\n"), ["# a", `# shell-watchdog:${TAG}`, guardLine(), "# b"]);
+  assert.deepEqual(addTag("# a\r\n./job.sh", TAG).split("\n"), ["# a\r", `# shell-watchdog:${TAG}`, guardLine(), "./job.sh"]);
+  for (const text of [named, "./job.sh", "\n# late\n./job.sh", "# odd \\\n./job.sh", "# a\n# odd \\\n./job.sh", "# a\n# b", "# a\r\n./job.sh", "", "# only"]) {
+    assert.deepEqual(splitTag(addTag(text, TAG)), { tag: TAG, command: text }, JSON.stringify(text));
+    assert.equal(stripTags(text), text);
+  }
+
+  // What an older version put in front of a command is still understood.
+  assert.deepEqual(splitTag(`# shell-watchdog:${TAG}\n${guardLine()}\n${command}`), { tag: TAG, command });
   assert.deepEqual(splitTag(`# shell-watchdog:${TAG.toUpperCase()}\n./job.sh`), { tag: TAG, command: "./job.sh" }, "a tag line without its guard line");
+  assert.deepEqual(splitTag(`# shell-watchdog:${TAG}\r\n./job.sh`), { tag: TAG, command: "./job.sh" });
 
   assert.deepEqual(splitTag("./job.sh"), { tag: null, command: "./job.sh" });
-  assert.equal(splitTag("echo hi\n# shell-watchdog:" + TAG + "\n").tag, null, "only as the first line");
+  assert.equal(splitTag("echo hi\n# shell-watchdog:" + TAG + "\n").tag, null, "only in the head");
+  assert.equal(splitTag("# a\n\n# shell-watchdog:" + TAG + "\n./job.sh").tag, null, "only in the head");
+  assert.equal(splitTag(`cat <<EOF\n# shell-watchdog:${TAG}\nEOF\n`).tag, null);
   assert.equal(splitTag(`# shell-watchdog:${TAG}`).tag, null, "only as a whole line");
-  assert.equal(stripTags(addTag(addTag(command, TAG), TAG.replace("0a", "0b"))), command, "every tag layer is removed");
+  assert.equal(splitTag(`# shell-watchdog:${TAG} x\n./job.sh`).tag, null, "only as a whole line");
+  assert.equal(splitTag(`# a\n${guardLine()}\n./job.sh`).command, `# a\n${guardLine()}\n./job.sh`, "a guard line alone is left where it is");
+
+  // Several tags: the last one counts, and every one of them goes, with the guard lines.
+  const other = TAG.replace("0a", "0b");
+  assert.equal(stripTags(addTag(addTag(command, TAG), other)), command, "every tag layer is removed");
+  assert.equal(splitTag(addTag(addTag(command, TAG), other)).tag, other);
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n${guardLine()}\n${addTag(command, other)}`), command, "old layout around the new one");
+  assert.equal(stripTags(`# shell-watchdog:${TAG}\n# nightly\n./job.sh`), "# nightly\n./job.sh", "a tag that is not the last line of the head");
   assert.equal(stripTags(command), command);
 });
 
@@ -535,6 +587,9 @@ test("texts are cut by bytes, never inside a character", () => {
 
 test("report text is bounded", () => {
   assert.equal(shortCommand(addTag("# watchdog: report=5m\n./a.sh\n./b.sh", TAG)), "./a.sh … (+1 more lines)");
+  assert.equal(shortCommand(addTag("# nightly build\n# watchdog: kill-runtime=2h\n./a.sh\n./b.sh", TAG)), "# nightly build … (+2 more lines)", "the name of the job is shown, its settings are not");
+  assert.equal(shortCommand("# watchdog: report=5m\n# watchdog: silence=off\n./a.sh"), "./a.sh");
+  assert.equal(shortCommand("./a.sh\n# watchdog: report=5m\n./b.sh"), "./a.sh … (+2 more lines)", "below the head it is a line like any other");
   assert.equal(shortCommand(addTag("./job.sh", TAG)), "./job.sh", "neither of the two tag lines is shown");
   assert.ok(size(shortCommand("x".repeat(5000))) <= 200);
   assert.ok(size(shortCommand(`${"я".repeat(5000)}\nmore`)) <= 200);
@@ -608,4 +663,47 @@ test("report and status texts", () => {
   assert.match(statusReport, /sh_1 status: active, last output 0s ago/);
   assert.match(statusReport, /Output so far: \(none\)/);
   assert.match(statusReport, /Next status in 5m/);
+});
+
+test("a command that has printed nothing is not said to have a last output", () => {
+  const mute = record({ silence: 0, report: 5 * MIN });
+  pass(mute, 5 * MIN);
+  const due = decide(mute);
+  assert.match(reportBlock({ rec: mute, decision: due, outcome: commit(mute, due), tail: [] }), /^\[shell-watchdog\] sh_1 status: active, no output yet \(running 5m, pid 4242\)\./);
+  assert.match(statusBlock(mute), /^sh_1: active, no output yet \(running 5m, pid 4242\)/);
+  // One byte is enough, and it stays true when the output is over.
+  pass(mute, MIN, ["a line"]);
+  pass(mute, 2 * MIN);
+  assert.match(statusBlock(mute), /^sh_1: active, last output 2m ago \(running 8m, pid 4242\)/);
+  // With stall reports on, silence from the start is called silence, as before.
+  const silent = record();
+  pass(silent, 6 * MIN);
+  assert.match(statusBlock(silent), /^sh_1: no output for 6m \(running 6m, pid 4242\)/);
+});
+
+test("the first report of a silence says how to set the limit at launch, once, and only if nothing was set", () => {
+  const HINT = /\nTo set this when launching a command, give it a comment line near the top: "# watchdog: silence=30m", or "# watchdog: silence=off" for one that prints nothing until it ends\.$/;
+  const say = (rec) => {
+    const decision = decide(rec);
+    assert.equal(decision.stall, true);
+    return reportBlock({ rec, decision, outcome: commit(rec, decision), tail: [] });
+  };
+  const plain = record();
+  pass(plain, 6 * MIN);
+  assert.match(say(plain), HINT);
+  pass(plain, 10 * MIN);
+  assert.doesNotMatch(say(plain), /when launching/, "not again for the same silence");
+  pass(plain, MIN, ["back"]);
+  pass(plain, 6 * MIN);
+  assert.match(say(plain), HINT, "a new silence is a new occasion");
+
+  const directed = record({}, { directed: true });
+  pass(directed, 6 * MIN);
+  assert.doesNotMatch(say(directed), /when launching/, "its author knows the line already");
+
+  const looping = record();
+  for (let i = 0; i < 14; i++) pass(looping, 30_000, ["retrying"]);
+  const loop = say(looping);
+  assert.match(loop, /still printing, but nothing new/);
+  assert.doesNotMatch(loop, /when launching/, "the hint is about silence");
 });

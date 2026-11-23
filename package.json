@@ -1,6 +1,6 @@
 {
   "name": "opencode-shell-watchdog",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin: tells the agent when a background shell command has gone silent or started repeating itself, so a hung script cannot stall a session for hours.",
   "type": "module",
   "license": "MIT",

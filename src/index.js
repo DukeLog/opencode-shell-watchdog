@@ -15,11 +15,17 @@ const EVENTS = ["shell.created", "shell.exited", "shell.deleted", "session.delet
 
 // Code Mode shows only the first paragraph of a description, cut at about 500 characters. Everything
 // the model has to know before it launches a command is therefore said there, and briefly.
-const TOOL_DESCRIPTION = `Watchdog for shell commands you leave running: a "[shell-watchdog]" message arrives when one goes silent or repeats its output, and you decide whether to wait or stop it. Set limits at launch with a first-line comment: "# watchdog: report=5m" (status every 5m), "# watchdog: silence=30m", "# watchdog: kill-runtime=2h kill-silence=20m" (auto-kill, launch only), "# watchdog: off". Call with no arguments to list watched commands, or with "id" and settings to change limits.
+const TOOL_DESCRIPTION = `Watches shell commands you leave running: when one goes silent or repeats its output, a "[shell-watchdog]" message arrives and you decide to wait or stop it. Set limits at launch with a comment line under a first comment naming the job: "# watchdog: report=5m" (status every 5m), "# watchdog: silence=30m", "# watchdog: kill-runtime=2h kill-silence=20m" (auto-kill, launch only), "# watchdog: off". Call with no arguments to list watched commands, or with "id" to change limits.
 
 Every shell command you start is watched. Nothing is killed automatically unless a kill limit was given at launch.
 
-Settings, in the first-line comment (name=value, separated by spaces) or as arguments of this tool:
+A command with limits looks like this. Lists of running commands show the first line of a command, so that line names the job:
+# nightly build of the docs
+# watchdog: report=10m silence=off
+./build.sh
+The "# watchdog:" line counts anywhere among the comment lines the command opens with, the very first line included, and nowhere below them. A command that prints nothing until it ends (output sent to a file, a result only at the end) needs "silence=off" or a "silence" longer than its run.
+
+Settings, in the "# watchdog:" line (name=value, separated by spaces) or as arguments of this tool:
 - silence: report when nothing happens for this long ("5m", "90s", "1h30m"); "off" stops stall reports
 - loop: what counts as "something happened" - "exact" (a line not printed recently), "shape" (same, ignoring numbers), "off" (any output)
 - report: a status report at this interval whatever the command is doing; "off" to stop

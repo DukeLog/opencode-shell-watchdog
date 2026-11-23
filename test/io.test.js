@@ -108,6 +108,15 @@ test("a command with a live guard behaves like the same command without one", { 
     "exit 3",
     "echo out; false",
     "# watchdog: kill-runtime=1h\necho directive; exit 4",
+    // The guard goes below the comment lines a command opens with, wherever they end.
+    "# nightly build\n# watchdog: kill-runtime=1h\necho named; exit 4",
+    "#!/bin/sh\n# nightly build\necho shebang; (exit 2)",
+    "# nightly build\ncat <<EOF\nbody $((1 + 1))\nEOF",
+    "# nightly build\n\n# later\necho gap; exit 6",
+    "# odd \\\necho after a comment that ends in a backslash; exit 3",
+    "# nightly build\n# odd \\\necho mixed; exit 5",
+    "# nothing but\n# comments",
+    "# a comment and no newline",
     "f() { return 5; }; f",
     "exit() { return 0; }; false",
     "cat <<EOF\nhello", // a heredoc that runs to the end of the script
@@ -139,23 +148,27 @@ test("a command with a live guard behaves like the same command without one", { 
 test("the guard makes its claim for its shell, stops its own process group when told, and nothing else", { skip: !posix }, async (t) => {
   for (const shell of SHELLS) {
     await t.test(shell, async () => {
-      // A child that ignores SIGTERM, and a last command the shell replaces itself with.
-      const job = guarded("(trap '' TERM; sleep 60) &\nsleep 60");
-      const main = start(shell, job.command, job.env);
-      const bystander = start(shell, "sleep 60");
-      try {
-        assert.ok(await until(async () => (await io.readClaim(job.claim)) === String(main.pid)), `claim: ${await io.readClaim(job.claim)}`);
-        assert.ok((await group(main.pid)).length >= 3, "the command, its child and the guard share one group");
-        assert.equal(io.alive(main.pid), true);
+      // A child that ignores SIGTERM, and a last command the shell replaces itself with. Once as it
+      // is, once below comment lines: there the guard is not the first thing in the text.
+      for (const head of ["", "# nightly build\n# watchdog: kill-runtime=1h\n"]) {
+        const job = guarded(`${head}(trap '' TERM; sleep 60) &\nsleep 60`);
+        assert.equal(job.command.startsWith(head), true);
+        const main = start(shell, job.command, job.env);
+        const bystander = start(shell, "sleep 60");
+        try {
+          assert.ok(await until(async () => (await io.readClaim(job.claim)) === String(main.pid)), `claim: ${await io.readClaim(job.claim)}`);
+          assert.ok((await group(main.pid)).length >= 3, "the command, its child and the guard share one group");
+          assert.equal(io.alive(main.pid), true);
 
-        await io.requestStop(job.claim);
-        const end = await main.exited;
-        assert.ok(end.signal === "SIGTERM" || end.code === 143, `the command got SIGTERM: ${JSON.stringify(end)}`);
-        assert.ok(await until(async () => (await group(main.pid)).length === 0), "SIGKILL took the child that ignored SIGTERM, and the guard itself");
-        assert.equal(io.alive(main.pid), false);
-        assert.equal(io.alive(bystander.pid), true, "another command is not touched");
-      } finally {
-        killGroups(main.pid, bystander.pid);
+          await io.requestStop(job.claim);
+          const end = await main.exited;
+          assert.ok(end.signal === "SIGTERM" || end.code === 143, `the command got SIGTERM: ${JSON.stringify(end)}`);
+          assert.ok(await until(async () => (await group(main.pid)).length === 0), "SIGKILL took the child that ignored SIGTERM, and the guard itself");
+          assert.equal(io.alive(main.pid), false);
+          assert.equal(io.alive(bystander.pid), true, "another command is not touched");
+        } finally {
+          killGroups(main.pid, bystander.pid);
+        }
       }
     });
   }
