@@ -164,27 +164,65 @@ export function handleEvent(state, io, event) {
 const GENERATION = 2;
 
 /**
- * Was this made by an older version of the plugin, and is it still as it was made? While a server
- * takes a plugin update, instances of both versions follow the same events for a while, and the
- * older one may see a command first: it reads the first line only, so it misses settings and tag
- * of a command that opens with a name. Such a record is made again by the first newer instance
- * that sees the event, as long as nothing has happened to it. One that came with its tag was read
- * correctly, and its tag is used up: it stays.
+ * A command that is known already, and its event once more. Nothing to do, but for one case: while a
+ * server takes a plugin update, instances of both versions follow the same events for a while, and
+ * an older one may have seen the command first. It read the command its own way, so settings and
+ * tag may be wrong. The first newer instance that sees the event reads the command again, as long
+ * as nothing has happened to the record.
+ *
+ * The command stays known whatever the event says by now: this is not a launch being accepted, so
+ * its age, its pid and the other commands are not looked at. A tag the older version had confirmed
+ * is kept if the text still shows it; it was used up when it was confirmed.
  */
-function outdated(state, id) {
+function reread(state, io, id, info) {
   const rec = state.shells.get(id);
-  const made = rec ?? state.pending.get(id)?.raw;
-  if (!made || (made.generation ?? 1) >= GENERATION || made.tag) return false;
-  return !rec || (rec.clock === 0 && rec.rev === 0 && rec.lastReport === 0 && rec.episode.reports === 0 && !rec.checkAt && !rec.killed);
+  const entry = state.pending.get(id);
+  const known = rec ?? entry.raw;
+  if ((known.generation ?? 1) >= GENERATION || info.pid !== known.pid) return;
+  if (rec && !(rec.clock === 0 && rec.rev === 0 && rec.lastReport === 0 && rec.episode.reports === 0 && !rec.checkAt && !rec.killed && !rec.bound)) return;
+  // A record is made from the settings of its owner: without one it is left as it is.
+  const owner = ownerOf(state, known);
+  if (rec && !owner) return;
+
+  const split = splitTag(info.command);
+  let grant = null;
+  if (split.tag !== null) {
+    const issued = state.issued.get(split.tag);
+    if (issued) {
+      state.issued.delete(split.tag);
+      grant = { tag: split.tag, claim: issued.claim };
+    } else if (known.tag === split.tag && known.claim) grant = { tag: known.tag, claim: known.claim };
+  }
+  // A claim the command is left without is of no use any more: its guard may go.
+  if (known.claim && known.claim !== grant?.claim && !state.obsolete.has(known.claim)) state.obsolete.set(known.claim, state.obs);
+  const raw = {
+    id,
+    sessionID: known.sessionID,
+    pid: known.pid,
+    file: known.file,
+    command: stripTags(info.command),
+    tag: grant?.tag ?? null,
+    claim: grant?.claim ?? null,
+    foreignTag: split.tag !== null && !grant,
+    shell: String(info.shell ?? known.shell ?? ""),
+    cwd: known.cwd,
+    dir: known.dir,
+    workspace: known.workspace,
+    startedWall: known.startedWall,
+    generation: GENERATION,
+  };
+  state.shells.delete(id);
+  if (owner) {
+    state.pending.delete(id);
+    activate(state, io, owner, raw);
+  } else state.pending.set(id, { raw, at: entry.at });
 }
 
 function onCreated(state, io, info, location) {
   const id = info?.id;
   if (typeof id !== "string" || !Number.isInteger(info.pid) || info.pid <= 1) return;
-  if (outdated(state, id)) {
-    state.shells.delete(id);
-    state.pending.delete(id);
-  } else if (state.shells.has(id) || state.pending.has(id) || state.done.has(id)) return;
+  if (state.shells.has(id) || state.pending.has(id)) return reread(state, io, id, info);
+  if (state.done.has(id)) return;
   const started = Number(info.time?.started);
   // Events may come late and more than once, but a pid has one owner at a time. An event about a
   // start that is known to be older than a watched command of the same pid is about a command that

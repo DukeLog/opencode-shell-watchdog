@@ -1053,35 +1053,86 @@ test("a plugin update on a running server: what the older version made of a comm
   assert.equal(plain.a.sent.length, 6, "the status every 2m, and no stall report for either");
   assert.doesNotMatch(plain.a.sent.map((message) => message.text).join("\n"), /sh_2|no output for/);
 
-  // What the older version read correctly stays as it is: a command that came with its tag (the
-  // tag is used up and could not be had again), and one that something has happened to since.
+  // A command that came with its tag at the very top, which the older version confirmed: the tag is
+  // used up and could not be had again, so it is carried over. The settings are read again all the
+  // same - here the older version is one that took a limit from below the head.
   const kept = await started();
-  const oldLayout = `# shell-watchdog:${FIRST_TAG}\n${guardLine()}\n${KILL_COMMAND}`;
-  kept.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
-  const tagged = old(kept.w, kept.a, "sh_1", 100, KILL_COMMAND, { tag: FIRST_TAG, claim: FIRST_CLAIM });
-  tagged.settings.killSilence = 2 * MIN;
-  tagged.settings.silence = 0;
-  kept.w.created("sh_1", { pid: 100, command: oldLayout });
-  assert.equal(kept.w.state.shells.get("sh_1"), tagged);
+  const below = "# watchdog: kill-silence=1h silence=off\necho ready # shell-watchdog guard\n# watchdog: kill-runtime=1m\nsleep 600";
+  const belowText = launch(kept.w, kept.a, below);
+  const firstTag = splitTag(belowText).tag;
+  const firstClaim = kept.w.state.issued.get(firstTag).claim;
+  kept.w.state.issued.delete(firstTag); // confirmed, as the older version did it
+  kept.w.claims.set(firstClaim, { pid: "100", stop: false });
+  const misread = old(kept.w, kept.a, "sh_1", 100, below, { tag: firstTag, claim: firstClaim });
+  misread.settings.killRuntime = MIN;
+  kept.w.created("sh_1", { pid: 100, command: belowText });
+  const reread = kept.w.state.shells.get("sh_1");
+  assert.notEqual(reread, misread);
+  assert.deepEqual([reread.generation, reread.tag, reread.claim, reread.settings.killSilence, reread.settings.killRuntime, reread.notes], [2, firstTag, firstClaim, 60 * MIN, 0, []]);
+  assert.deepEqual([...kept.w.state.obsolete.keys()], [], "its claim is in use");
+
+  // One that something has happened to since stays as it is, and so does one of another process.
   const seen = old(kept.w, kept.a, "sh_2", 200, "# nightly build\n# watchdog: report=2m\n./job.sh");
-  await kept.w.run(kept.a, TICK, () => kept.w.print("sh_2", `line ${n++}\n`));
+  await kept.w.run(kept.a, TICK, () => kept.w.print("sh_1", `step ${n++}\n`));
   kept.w.created("sh_2", { pid: 200, command: "# nightly build\n# watchdog: report=2m\n./job.sh" });
   assert.equal(kept.w.state.shells.get("sh_2"), seen, "not after a pass has looked at it");
   assert.equal(seen.settings.report, 0);
-  await kept.w.run(kept.a, 2 * MIN, () => kept.w.print("sh_2", `line ${n++}\n`));
-  assert.deepEqual(kept.w.stops, [FIRST_CLAIM], "the limit of the command that came with its tag is in force");
+  const other = old(kept.w, kept.a, "sh_3", 300, "# nightly build\n# watchdog: report=2m\n./job.sh");
+  kept.w.created("sh_3", { pid: 301, command: "# nightly build\n# watchdog: report=2m\n./job.sh" });
+  assert.equal(kept.w.state.shells.get("sh_3"), other);
+  await kept.w.run(kept.a, 30 * MIN, () => kept.w.print("sh_1", `step ${n++}\n`));
+  assert.deepEqual(kept.w.stops, [], "the limit from below the head was never in force");
 
-  // A command without an owner yet, held by the older version as it came in.
+  // A command that came with its tag and was read correctly: read again, the same, and its limit works.
+  const right = await started();
+  const rightText = launch(right.w, right.a, KILL_COMMAND);
+  right.w.state.issued.delete(FIRST_TAG);
+  right.w.claims.set(FIRST_CLAIM, { pid: "100", stop: false });
+  const confirmed = old(right.w, right.a, "sh_1", 100, KILL_COMMAND, { tag: FIRST_TAG, claim: FIRST_CLAIM });
+  confirmed.settings.killSilence = 2 * MIN;
+  confirmed.settings.silence = 0;
+  right.w.created("sh_1", { pid: 100, command: rightText });
+  const again = right.w.state.shells.get("sh_1");
+  assert.deepEqual([again.generation, again.tag, again.claim, again.settings.killSilence, again.command], [2, FIRST_TAG, FIRST_CLAIM, 2 * MIN, KILL_COMMAND]);
+  await right.w.run(right.a, 2.5 * MIN);
+  assert.deepEqual(right.w.stops, [FIRST_CLAIM]);
+
+  // A tag in the text that nobody confirmed and nobody issued gives no limit, whoever reads it.
+  const forged = await started();
+  const forgedText = addTag(KILL_COMMAND, "ffffffff-1111-2222-3333-444444444444");
+  old(forged.w, forged.a, "sh_1", 100, forgedText);
+  forged.w.created("sh_1", { pid: 100, command: forgedText });
+  const refused = forged.w.state.shells.get("sh_1");
+  assert.deepEqual([refused.tag, refused.claim, refused.settings.killSilence], [null, null, 0]);
+  assert.deepEqual(refused.notes, ["kill limits (the id in the command was not issued for this launch)"]);
+
+  // A command without an owner yet, held by the older version as it came in. Its event comes again
+  // much later (a stream that was opened again): the command stays known, and is not taken for a
+  // launch that is too old to be accepted.
   const waiting = world();
   const first = waiting.instance("/a");
   waiting.session("ses_1");
   await tick(waiting.state, waiting.io, first);
   const forB = "# for another location\n# watchdog: report=2m silence=off\n./job.sh";
-  waiting.state.pending.set("sh_1", { raw: { id: "sh_1", sessionID: "ses_1", pid: 100, file: "/out/sh_1", command: forB, tag: null, claim: null, foreignTag: false, shell: "/bin/zsh", dir: "/b", workspace: null, startedWall: waiting.wall }, at: 0 });
-  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB });
-  assert.equal(waiting.state.pending.get("sh_1").raw.generation, 2);
-  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB });
+  waiting.files.set("/out/sh_1", { ino: 100, data: Buffer.alloc(0) });
+  waiting.alive.add(100);
+  const started0 = waiting.wall;
+  waiting.state.pending.set("sh_1", { raw: { id: "sh_1", sessionID: "ses_1", pid: 100, file: "/out/sh_1", command: forB, tag: null, claim: null, foreignTag: false, shell: "/bin/zsh", dir: "/b", workspace: null, startedWall: started0 }, at: waiting.state.obs });
+  const heldAt = waiting.state.pending.get("sh_1").at;
+  await waiting.run(first, 6 * MIN);
+  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB, started: started0 });
+  assert.deepEqual([waiting.state.pending.get("sh_1").raw.generation, waiting.state.pending.get("sh_1").at, waiting.state.done.has("sh_1")], [2, heldAt, false]);
+  waiting.created("sh_1", { pid: 100, dir: "/b", command: forB, started: started0 });
   assert.equal(waiting.state.pending.size, 1);
+  const second = waiting.instance("/b");
+  assert.deepEqual([waiting.state.pending.size, waiting.state.shells.get("sh_1").settings.report, waiting.state.shells.get("sh_1").settings.silence], [0, 2 * MIN, 0]);
+
+  // A record whose owner has gone before it was looked at: left as it is, never dropped.
+  const orphan = old(waiting, second, "sh_2", 200, "# nightly build\n# watchdog: off\n./job.sh", { dir: "/c" });
+  await waiting.run(first, 6 * MIN);
+  waiting.created("sh_2", { pid: 200, dir: "/c", command: "# nightly build\n# watchdog: off\n./job.sh", started: started0 });
+  assert.equal(waiting.state.shells.get("sh_2"), orphan);
+  assert.equal(waiting.state.done.has("sh_2"), false);
 });
 
 test("kill limits exist only for commands with a guard; the tool cannot add one later", async () => {
